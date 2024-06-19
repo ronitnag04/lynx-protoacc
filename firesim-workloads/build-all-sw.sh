@@ -15,8 +15,6 @@ rm -rf primitive-benchmarks/*.riscv
 rm -rf primitive-benchmarks/*.x86
 time make -f Makefile -j64 all
 
-exit 11
-
 python gen-primitive-tests-serializer.py
 rm -rf primitive-benchmarks-serializer/*.riscv
 rm -rf primitive-benchmarks-serializer/*.x86
