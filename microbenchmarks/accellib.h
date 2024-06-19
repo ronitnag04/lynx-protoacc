@@ -1,5 +1,7 @@
 #include "rocc.h"
+
 #include <string>
+#include <stdint.h>
 
 #define PROTOACC_OPCODE 2
 #define FUNCT_SFENCE 0

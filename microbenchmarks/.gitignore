@@ -11,3 +11,5 @@ host-gcc-build/gcc-9.2.0/
 runlogs/
 testsfrag.mk
 testsfrag-serializer.mk
+_build
+_install

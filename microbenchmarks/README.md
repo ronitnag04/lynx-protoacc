@@ -1,0 +1,2 @@
+- Make sure conda env is sourced
+- `build-protobuf-all.sh`
