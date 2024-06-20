@@ -3,4 +3,4 @@
 	url = https://github.com/sagark/protobuf-library-for-accel-ae
 [submodule "firesim-workloads/hyperproto/HyperProtoBench"]
 	path = software/firesim-workloads/hyperproto/HyperProtoBench
-	url = https://github.com/sagark/HyperProtoBench
+	url = https://github.com/abejgonzalez/hyperscale-grpc-hyperprotobench.git
