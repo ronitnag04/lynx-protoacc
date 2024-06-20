@@ -1,0 +1,26 @@
+# Requires that PROTOBUF_INSTALL_DIR and ACCELLIB_DIR is set
+
+ifndef PROTOBUF_INSTALL_DIR
+$(error Unset PROTOBUF_INSTALL_DIR)
+endif
+
+ifndef ACCELLIB_DIR
+$(error Unset ACCELLIB_DIR)
+endif
+
+X86INSTALLDIR=$(PROTOBUF_INSTALL_DIR)/x86
+RISCVINSTALLDIR=$(PROTOBUF_INSTALL_DIR)/riscv
+
+PROTOC = $(X86INSTALLDIR)/bin/protoc
+
+RVPREFIX = riscv64-unknown-linux-gnu
+RVCPP = $(RVPREFIX)-g++
+RVSTRIP = $(RVPREFIX)-strip
+
+X86CPP = g++
+X86STRIP = strip
+
+CPPFLAGS = -std=c++14 -static -g3 -O3 -DNDEBUG
+
+ACCELCPP = $(ACCELLIB_DIR)/accellib.cpp
+ACCELH = $(ACCELLIB_DIR)/rocc.h $(ACCELLIB_DIR)/accellib.h

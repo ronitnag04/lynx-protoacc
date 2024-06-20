@@ -1,9 +1,6 @@
-[submodule "firesim-workloads/linux"]
-	path = firesim-workloads/linux
-	url = https://github.com/firesim/linux.git
 [submodule "microbenchmarks/protobuf"]
-	path = microbenchmarks/protobuf
+	path = software/protobuf
 	url = https://github.com/sagark/protobuf-library-for-accel-ae
 [submodule "firesim-workloads/hyperproto/HyperProtoBench"]
-	path = firesim-workloads/hyperproto/HyperProtoBench
+	path = software/firesim-workloads/hyperproto/HyperProtoBench
 	url = https://github.com/sagark/HyperProtoBench

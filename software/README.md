@@ -1,0 +1,4 @@
+- ``cd $CHIPYARD_DIR && source env.sh``. Chipyard Conda environment must be sourced
+- ``build-all-sw.sh``. Builds all SW
+- ``build-protobuf.sh``. Builds x86/RISC-V protobuf
+- ``microbenchmarks/build-protobuf.sh``. Builds x86/RISC-V microbenchmarks

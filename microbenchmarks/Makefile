@@ -1,5 +1,0 @@
-CURRENT_DIR := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
-
-include $(CURRENT_DIR)/common.mk
-include $(CURRENT_DIR)/testsfrag.mk
-include $(CURRENT_DIR)/rules.mk
