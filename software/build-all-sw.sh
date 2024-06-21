@@ -13,13 +13,15 @@ cd $SCRIPTDIR
 cd microbenchmarks
 ./build.sh
 
-cd $SCRIPTDIR/firesim-workloads
-cd hyperproto
+# build hyperprotobench
+cd $SCRIPTDIR/firesim-workloads/hyperproto
 ./buildall.sh
-./copy.sh $SCRIPTDIR/firesim-workloads
 
 # build images
 cd $SCRIPTDIR/firesim-workloads
+pushd hyperproto
+./copy.sh $SCRIPTDIR/firesim-workloads
+popd
 cd boom-plain-bmarks && ./build.sh
 cd ../protoacc-des-bmarks && ./build.sh
 cd ../protoacc-ser-bmarks && ./build.sh
