@@ -1,7 +1,8 @@
 {
-  "name" : "protoacc-ser-bmarks",
+  "name" : "protoacc-ser-bmarks-htif",
   "base" : "br-base.json",
   "rootfs-size" : "1G",
+  "linux-config" : "kfrag",
   "workdir" : ".",
   "overlay" : "overlay",
   "jobs" : [
