@@ -2,8 +2,8 @@
 
 set -ex
 
-cp ../../microbenchmarks/primitive-tests-serializer/*.riscv overlay/root/ubmarks/
-cp ../../microbenchmarks/testsfrag-serializer.mk overlay/root/ubmarks/testsfrag.mk
+cp -f ../../microbenchmarks/primitive-tests-serializer/*.riscv overlay/root/ubmarks/
+cp -f ../../microbenchmarks/testsfrag-serializer.mk overlay/root/ubmarks/testsfrag.mk
 
 sed -i '/x86/d' overlay/root/ubmarks/testsfrag.mk
 sed -i '/ = /d' overlay/root/ubmarks/testsfrag.mk

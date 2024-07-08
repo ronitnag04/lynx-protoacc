@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
 class PrimitiveInfo:
-    def __init__(self, testname, primname, cpptype, testvals, is_repeated=False, nestedtype=None):
+    def __init__(self, testname, primname, cpptype, testvals, is_repeated=False, nestedtype=None, num_repeated=1):
         self.testname = testname
         self.primname = primname
         self.cpptype = cpptype
         self.testvals = testvals
         self.is_repeated = is_repeated
+        self.num_repeated = num_repeated # num of types the value is repeated
         self.nestedtype = nestedtype
         if self.nestedtype is not None and self.is_repeated:
             exit(1)
@@ -55,7 +56,10 @@ class PrimitiveInfo:
 
     def get_setter_line(self, fieldindex):
         if self.is_repeated:
-            msg = """fillmessage->add_pacc{FIELDTYPE}_{FIELDINDEX}(testvals[{FIELDINDEX}]);""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex)
+            msg = ""
+            for i in range(self.num_repeated):
+                msg = msg + """fillmessage->add_pacc{FIELDTYPE}_{FIELDINDEX}(testvals[{FIELDINDEX}]);""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex)
+                msg = msg + "\n"
         elif self.nestedtype is not None:
             msg = """nested_message->set_pacc{NESTEDFIELDTYPE}_{FIELDINDEX}(testvals[{FIELDINDEX}]);
             fillmessage->set_allocated_pacc{FIELDTYPE}_{FIELDINDEX}(nested_message);
@@ -118,6 +122,7 @@ primitive_info_objs = [
 
     PrimitiveInfo("bytes", "bytes", "string", ['"hello"']),
     PrimitiveInfo("bytes_repeated", "bytes", "string", ['"hello"'], is_repeated=True),
+    PrimitiveInfo("bytes_repeated_2", "bytes", "string", ['"hello"'], is_repeated=True, num_repeated=2),
 
     PrimitiveInfo("bytes_long", "bytes", "string", ['"hello hello hello hello hello hello hello"']),
     PrimitiveInfo("bytes_very_long", "bytes", "string", ['"' + ("a" * 489) + '"']),
@@ -226,6 +231,7 @@ def cpp_test_contents(fieldtypeobj):
 {SETTERLINES}
 
             #define SERITERS 1000
+            #define RUN_CPU
 
             primitivetests::{MESSAGENAME}* parseintos[SERITERS];
 
@@ -236,6 +242,7 @@ def cpp_test_contents(fieldtypeobj):
 {SETTERLINES}
             }}
 
+            #ifdef RUN_CPU
             string outstr;
             fillmessage->SerializeToString(&outstr);
             char * cpuserialized = (char*)outstr.c_str();
@@ -249,6 +256,7 @@ def cpp_test_contents(fieldtypeobj):
             uint64_t singleserializedlen = outstr.length();
             std::cout << "encodedlen " << singleserializedlen << "\\n" << std::flush;
             uint64_t total_bytes_processed = singleserializedlen * SERITERS;
+            #endif
 
 
 #ifdef __riscv
@@ -265,7 +273,9 @@ def cpp_test_contents(fieldtypeobj):
             auto t2 = std::chrono::steady_clock::now();
             auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
             std::cout << (duration1 / (SERITERS * 1.0)) << ", us per iter, " << hostplat << "-accel, {TESTNAME}, " << testvals[0] << "\\n" << std::flush;
+            #ifdef RUN_CPU
             std::cout << (((double)(total_bytes_processed)) / (((double)duration1) / 1000000.0)  / 1000000000.0 * 8) << ", Gbits/s, " << hostplat << "-accel, {TESTNAME}, " << testvals[0] << "\\n" << std::flush;
+            #endif
 
             std::cout << "ACCEL: SERIALIZEDLENGTH: " << serlen << ", SERPTR: " << ((uint64_t)serres) << "\\n" << std::flush;
             for (int l = 0; l < serlen; l++) {{
@@ -277,6 +287,7 @@ def cpp_test_contents(fieldtypeobj):
                 volatile char * serres = BlockOnSerializedValue(serializeoutputs, iterser);
                 size_t serlen = GetSerializedLength(serializeoutputs, iterser);
 
+                #ifdef RUN_CPU
                 if (serlen != cpuserialized_len) {{
                     printf("FAIL MISMATCHED LEN\\n");
                     exit(1);
@@ -286,12 +297,15 @@ def cpp_test_contents(fieldtypeobj):
                         printf("FAIL MISMATCHED VALUE\\n");
                     }}
                 }}
+                #endif
             }}
 
 #endif
 
             std::cout << "s6\\n" << std::flush;
 
+
+             #ifdef RUN_CPU
             primitivetests::{MESSAGENAME}* parseintoscpu[SERITERS];
 
             char * seroutputscpu[SERITERS];
@@ -331,6 +345,8 @@ def cpp_test_contents(fieldtypeobj):
             }}
 
         std::cout << "s7\\n" << std::flush;
+
+         #endif
 
         google::protobuf::ShutdownProtobufLibrary();
         return 0;

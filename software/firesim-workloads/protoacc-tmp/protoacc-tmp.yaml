@@ -1,0 +1,7 @@
+{
+  "name" : "protoacc-tmp",
+  "base" : "br-base.json",
+  "workdir" : ".",
+  "overlay" : "overlay",
+  "command" : "/root/bool.riscv && poweroff -f"
+}

@@ -3,5 +3,8 @@ primitive-tests/
 primitive-tests-serializer/
 primitive-tests-serializer/
 runlogs/
+*.dump
+*.riscv
+*.x86
 testsfrag.mk
 testsfrag-serializer.mk

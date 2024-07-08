@@ -1,7 +1,6 @@
-
-echo "Warming up."
-./root/ubmarks/run-all.sh > /dev/null
-
+#echo "Warming up."
+#./root/ubmarks/run-all.sh > /dev/null
+#
 echo "Running all ubmarks."
 ./root/ubmarks/run-all.sh
 

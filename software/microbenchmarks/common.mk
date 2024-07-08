@@ -16,9 +16,11 @@ PROTOC = $(X86INSTALLDIR)/bin/protoc
 RVPREFIX = riscv64-unknown-linux-gnu
 RVCPP = $(RVPREFIX)-g++
 RVSTRIP = $(RVPREFIX)-strip
+RVOBJDUMP = $(RVPREFIX)-objdump
 
 X86CPP = g++
 X86STRIP = strip
+X86OBJDUMP = objdump
 
 CPPFLAGS = -std=c++14 -static -g3 -O3 -DNDEBUG
 

@@ -23,11 +23,11 @@ all: $(rvtests) $(x86tests)
 		$(protocc) \
 		$(ACCELCPP) \
 		-I $(ACCELLIB_DIR) \
+		-I primitive-tests-serializer \
 		-DACCEL_REGION_DEFAULT_SHIFT=13 \
 		-DACCEL_REGION_SER_SHIFT=13 \
 		`pkg-config --cflags --libs protobuf`
 	$(RVOBJDUMP) -S $@ > $@.dump
-	$(RVSTRIP) $@
 
 # note: pkg-config should be at the end
 %.x86: export PKG_CONFIG_PATH := $(X86INSTALLDIR)/lib/pkgconfig
@@ -37,8 +37,8 @@ all: $(rvtests) $(x86tests)
 		-o $@ \
 		$< \
 		$(protocc) \
+		-I primitive-tests-serializer \
 		`pkg-config --cflags --libs protobuf`
-	$(X86STRIP) $@
 
 .PHONY: check-pkgconfig-riscv
 check-pkgconfig-riscv: export PKG_CONFIG_PATH := $(RISCVINSTALLDIR)/lib/pkgconfig
