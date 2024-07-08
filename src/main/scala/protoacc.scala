@@ -10,7 +10,7 @@ import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 import freechips.rocketchip.tilelink._
 
-case object ProtoAccelPrintfEnable extends Field[Boolean](false)
+import protoacc.des._
 
 class ProtoAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(
     opcodes = opcodes, nPTWPorts = 4) {
@@ -91,41 +91,3 @@ with MemoryOpConstants {
 
   io.busy := Bool(false)
 }
-
-class WithProtoAccel extends Config ((site, here, up) => {
-  case ProtoTLB => Some(TLBConfig(nSets = 4, nWays = 4, nSectors = 1, nSuperpageEntries = 1))
-  case BuildRoCC => up(BuildRoCC) ++ Seq(
-    (p: Parameters) => {
-      val protoacc = LazyModule.apply(new ProtoAccel(OpcodeSet.custom2)(p))
-      protoacc
-    },
-    (p: Parameters) => {
-      val protoaccser = LazyModule.apply(new ProtoAccelSerializer(OpcodeSet.custom3)(p))
-      protoaccser
-    }
-  )
-})
-
-class WithProtoAccelSerOnly extends Config ((site, here, up) => {
-  case ProtoTLB => Some(TLBConfig(nSets = 4, nWays = 4, nSectors = 1, nSuperpageEntries = 1))
-  case BuildRoCC => up(BuildRoCC) ++ Seq(
-    (p: Parameters) => {
-      val protoaccser = LazyModule.apply(new ProtoAccelSerializer(OpcodeSet.custom3)(p))
-      protoaccser
-    }
-  )
-})
-
-class WithProtoAccelDeserOnly extends Config ((site, here, up) => {
-  case ProtoTLB => Some(TLBConfig(nSets = 4, nWays = 4, nSectors = 1, nSuperpageEntries = 1))
-  case BuildRoCC => up(BuildRoCC) ++ Seq(
-    (p: Parameters) => {
-      val protoacc = LazyModule.apply(new ProtoAccel(OpcodeSet.custom2)(p))
-      protoacc
-    }
-  )
-})
-
-class WithProtoAccelPrintf extends Config((site, here, up) => {
-  case ProtoAccelPrintfEnable => true
-})

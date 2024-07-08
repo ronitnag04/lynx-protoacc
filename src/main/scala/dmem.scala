@@ -1,4 +1,3 @@
-
 package protoacc
 
 import Chisel._

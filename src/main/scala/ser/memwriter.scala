@@ -1,4 +1,4 @@
-package protoacc
+package protoacc.ser
 
 import Chisel._
 import chisel3.{Printable, VecInit}
@@ -10,6 +10,7 @@ import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 import freechips.rocketchip.tilelink._
 
+import protoacc._
 
 class SerMemwriter()(implicit p: Parameters) extends Module
   with MemoryOpConstants {
@@ -312,5 +313,3 @@ class SerMemwriter()(implicit p: Parameters) extends Module
 
 
 }
-
-

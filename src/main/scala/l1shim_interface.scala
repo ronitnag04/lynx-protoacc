@@ -11,7 +11,6 @@ import freechips.rocketchip.rocket.constants.MemoryOpConstants
 import freechips.rocketchip.rocket.{RAS}
 import freechips.rocketchip.tilelink._
 
-
 class L1ReqInternal extends Bundle {
   val addr = UInt()
   val size = UInt()
@@ -291,5 +290,3 @@ class L1MemHelperModule(outer: L1MemHelper, printInfo: String = "", queueRequest
   }
 
 }
-
-

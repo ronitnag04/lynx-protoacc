@@ -574,4 +574,3 @@ class SerDescriptorTableHandler()(implicit p: Parameters) extends Module
   }
 
 }
-

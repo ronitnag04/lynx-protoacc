@@ -1,4 +1,4 @@
-package protoacc
+package protoacc.des
 
 import Chisel._
 import chisel3.{Printable}
@@ -10,6 +10,7 @@ import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 import freechips.rocketchip.rocket.{RAS}
 
+import protoacc._
 
 class HasBitsWriteRequest extends Bundle {
   val hasbits_base_addr = UInt(64.W)

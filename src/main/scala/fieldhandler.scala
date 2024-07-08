@@ -8,996 +8,641 @@ import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.rocket.{TLBConfig}
 import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
-import freechips.rocketchip.rocket.{RAS}
+import freechips.rocketchip.tilelink._
 
 
+class WriterBundle extends Bundle {
+  val data = UInt(128.W)
+  val last_for_arbitration_round = Bool()
+  val validbytes = UInt(6.W)
+  val depth = UInt(ProtoaccParams.MAX_NESTED_LEVELS_WIDTH.W)
+  val end_of_message = Bool()
+}
 
-class FieldHandler()(implicit p: Parameters) extends Module {
+class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
+  with MemoryOpConstants {
+
+
   val io = IO(new Bundle {
+    val ops_in = Decoupled(new DescrToHandlerBundle).flip
+    val memread = new L1MemHelperBundle
 
-    val consumer = Flipped(new MemLoaderConsumerBundle)
-
-    val l1helperUser = new L1MemHelperBundle
-
-    val l1helperUser2 = new L1MemHelperBundle
-
-    val fixed_writer_request = Decoupled(new FixedWriterRequest)
-
-    val fixed_alloc_region_addr = Flipped(Valid(UInt(64.W)))
-    val array_alloc_region_addr = Flipped(Valid(UInt(64.W)))
-
-    val completed_toplevel_bufs = Output(UInt(64.W))
+    val writer_output = Decoupled(new WriterBundle)
   })
 
+  val outputQ = Module(new Queue(new WriterBundle, 4))
+  io.writer_output <> outputQ.io.deq
+  outputQ.io.enq.valid := false.B
 
-  val completed_toplevel_bufs_reg = RegInit(0.U(64.W))
-  io.completed_toplevel_bufs := completed_toplevel_bufs_reg
+  io.memread.req.valid := false.B
+  io.memread.req.bits.cmd := M_XRD
+  io.memread.resp.ready := false.B
+  io.ops_in.ready := false.B
 
-  val just_completed_buffer = RegInit(Bool(false))
-  val last_consumer_transaction = (io.consumer.available_output_bytes === io.consumer.user_consumed_bytes) && io.consumer.output_last_chunk
+  val is_varint_signed = PROTO_TYPES.detailedTypeIsVarintSigned(io.ops_in.bits.src_data_type)
+  val is_int32 = io.ops_in.bits.src_data_type === PROTO_TYPES.TYPE_INT32
+  val cpp_size_log2 =  PROTO_TYPES.detailedTypeToCppSizeLog2(io.ops_in.bits.src_data_type)
+  val wire_type = PROTO_TYPES.detailedTypeToWireType(io.ops_in.bits.src_data_type)
+  val detailedTypeIsPotentiallyScalar = PROTO_TYPES.detailedTypeIsPotentiallyScalar(io.ops_in.bits.src_data_type)
+  val is_bytes_or_string = (io.ops_in.bits.src_data_type === PROTO_TYPES.TYPE_STRING) || (io.ops_in.bits.src_data_type === PROTO_TYPES.TYPE_BYTES)
+  val is_repeated = io.ops_in.bits.is_repeated
+  val is_packed = false.B
 
-  when (io.consumer.output_ready && io.consumer.output_valid) {
-    when (last_consumer_transaction) {
-      just_completed_buffer := Bool(true)
-      val next_completed_toplevel_bufs_reg = completed_toplevel_bufs_reg + 1.U
-      completed_toplevel_bufs_reg := next_completed_toplevel_bufs_reg
-      ProtoaccLogger.logInfo("completed bufs: current 0x%x, next 0x%x\n",
-        completed_toplevel_bufs_reg, next_completed_toplevel_bufs_reg)
-    }
-  }
+  val is_varint_signed_reg = RegInit(false.B)
+  val is_int32_reg = RegInit(false.B)
+  val cpp_size_log2_reg = RegInit(UInt(0, 3.W))
+  val cpp_size_nonlog2_fromreg = 1.U << cpp_size_log2_reg
+  val cpp_size_nonlog2_numbits_fromreg = cpp_size_nonlog2_fromreg << 3
+  val wire_type_reg = RegInit(UInt(0, log2Up(5).W))
+  val detailedTypeIsPotentiallyScalar_reg = RegInit(false.B)
 
+  val src_data_addr_reg = RegInit(0.U(64.W))
 
-  val processed_len_total = RegInit(0.U(64.W))
+  val unencoded_key = Cat(io.ops_in.bits.field_number, wire_type(2, 0))
+  val key_encoder = Module(new CombinationalVarintEncode)
+  key_encoder.io.inputData := unencoded_key
+  val encoded_key_reg = Reg(UInt())
+  val encoded_key_bytes_reg = Reg(UInt())
 
-  val stacks_index = RegInit(0.U(ProtoaccParams.MAX_NESTED_LEVELS_WIDTH.W))
-  assert(stacks_index < ProtoaccParams.MAX_NESTED_LEVELS.U, "FAIL. TOO MANY NESTED LEVELS")
+  val varintDataUnsigned = Wire(Bool())
+  val varintData64bit = Wire(Bool())
+  varintDataUnsigned := !is_varint_signed_reg
+  varintData64bit := cpp_size_log2_reg === 3.U
 
-  val out_addr_stack = Reg(Vec(ProtoaccParams.MAX_NESTED_LEVELS, UInt(64.W)))
-  val hasbits_offset_stack = Reg(Vec(ProtoaccParams.MAX_NESTED_LEVELS, UInt(64.W)))
-  val descr_table_stack = Reg(Vec(ProtoaccParams.MAX_NESTED_LEVELS, UInt(64.W)))
-  val lens_table_stack = RegInit(Vec(Seq.fill(ProtoaccParams.MAX_NESTED_LEVELS)(0.U(64.W))))
-  val min_field_no_stack = RegInit(Vec(Seq.fill(ProtoaccParams.MAX_NESTED_LEVELS)(0.U(32.W))))
-
-
-  val default_hasbits_val = (0x10).U(64.W)
-
-  val current_out_addr = Mux(stacks_index === 0.U,
-    io.consumer.output_decoded_dest_base_addr,
-    out_addr_stack(stacks_index))
-  val current_hasbits_offset = Mux(stacks_index === 0.U,
-    default_hasbits_val,
-    hasbits_offset_stack(stacks_index))
-  val current_descr_table = Mux(stacks_index === 0.U,
-    io.consumer.output_ADT_addr,
-    descr_table_stack(stacks_index))
-  val current_min_field_no = Mux(stacks_index === 0.U,
-    io.consumer.output_min_field_no,
-    min_field_no_stack(stacks_index))
-  val current_len = lens_table_stack(stacks_index)
+  val read_mask = Wire(UInt(128.W))
+  read_mask := ((1.U << (cpp_size_nonlog2_numbits_fromreg)) - 1.U)
 
 
+  val ORMASK = ((1.U(128.W) << 32) - 1.U) << 32
+  val mem_resp_masked = io.memread.resp.bits.data & read_mask
+  val maybe_extended_int32val = Mux(mem_resp_masked(31),
+    ORMASK | mem_resp_masked,
+    mem_resp_masked)
+  val mem_resp_raw = Mux(is_int32_reg,
+    maybe_extended_int32val,
+    mem_resp_masked)
+  val mem_resp_zigzag32 = (mem_resp_raw << 1) ^ Mux(mem_resp_raw(31), ~(0.U(32.W)), 0.U(32.W))
+  val mem_resp_zigzag64 = (mem_resp_raw << 1) ^ Mux(mem_resp_raw(63), ~(0.U(64.W)), 0.U(64.W))
 
-  when (io.consumer.output_ready && io.consumer.output_valid) {
-    when (last_consumer_transaction) {
-      ProtoaccLogger.logInfo("NStack: Clearing\n")
-      stacks_index := 0.U
-      processed_len_total := 0.U
-    } .otherwise {
-
-      val next_processed_len_total = processed_len_total + io.consumer.user_consumed_bytes
-      when (next_processed_len_total === current_len) {
-        ProtoaccLogger.logInfo("NStack: Removing an entry.\n")
-        stacks_index := stacks_index - 1.U
-      }
-      processed_len_total := next_processed_len_total
-    }
-  }
-
-
-  val descriptor_table_address_user = current_descr_table
-  val output_address_user = current_out_addr
-
-
-  val combo_varint_module = Module(new CombinationalVarint)
-  combo_varint_module.io.inputRawData := io.consumer.output_data
-  val varintlen = Wire(UInt())
-  varintlen := combo_varint_module.io.consumedLenBytes
-  val varintresult = Wire(UInt())
-  varintresult := combo_varint_module.io.outputData
-
-
-  when (io.consumer.output_ready && io.consumer.output_valid) {
-    ProtoaccLogger.logInfo("RAW DATA: %x, OUTPUT BYTES AVAIL: %x, DATA AS VARINT %x, VARINT LEN %x, BYTES CONSUMED %x\n",
-      io.consumer.output_data,
-      io.consumer.available_output_bytes,
-      varintresult,
-      varintlen,
-      io.consumer.user_consumed_bytes)
-  }
-
-
-  val NUM_BITS_FOR_STATES = 4
-  val sHandleVarint = 0.U(NUM_BITS_FOR_STATES.W)
-  val sHandle64bit  = 1.U(NUM_BITS_FOR_STATES.W)
-  val sHandleLengthDelim  = 2.U(NUM_BITS_FOR_STATES.W)
-  val sHandleStartGroup  = 3.U(NUM_BITS_FOR_STATES.W)
-  val sHandleEndGroup  = 4.U(NUM_BITS_FOR_STATES.W)
-  val sHandle32bit  = 5.U(NUM_BITS_FOR_STATES.W)
-
-  val sReadKey = 6.U(NUM_BITS_FOR_STATES.W)
-  val sPrepState = 7.U(NUM_BITS_FOR_STATES.W)
-  val sManageRepeatedAlloc = 8.U(NUM_BITS_FOR_STATES.W)
-  val sEndBufCloseurcArray = 9.U(NUM_BITS_FOR_STATES.W)
-
-
-  val fieldState = RegInit(sReadKey)
-  val wireTypeReg = RegInit(0.U(NUM_BITS_FOR_STATES.W))
-  val descriptor_responseReg = Reg(new DescriptorResponse)
-  val descriptor_responseReg_extra = Reg(new DescriptorResponseExtra)
-
-  io.consumer.user_consumed_bytes := UInt(0)
-  io.consumer.output_ready := Bool(false)
-
-  val field_no_reg = RegInit(UInt(0, 32.W))
-
-  val descriptor_table_handler = Module(new DescriptorTableHandler)
-
-  descriptor_table_handler.io.extra_meta_response.ready := Bool(false)
-
-  io.l1helperUser <> descriptor_table_handler.io.l1helperUser
-
-  val wire_type = varintresult & UInt(0x7)
-  val field_no = varintresult >> 3
-
-  descriptor_table_handler.io.field_dest_request.bits.proto_addr := output_address_user
-  descriptor_table_handler.io.field_dest_request.bits.relative_field_no := field_no - current_min_field_no
-  descriptor_table_handler.io.field_dest_request.bits.base_info_ptr := descriptor_table_address_user
-  descriptor_table_handler.io.field_dest_request.valid := Bool(false)
-  descriptor_table_handler.io.field_dest_response.ready := Bool(false)
-
-  io.fixed_writer_request.bits.write_addr := descriptor_responseReg.write_addr
-
-  io.fixed_writer_request.bits.write_width := UInt(0)
-  io.fixed_writer_request.bits.write_data := UInt(0)
-
-  val type_info =   descriptor_responseReg.proto_field_type
-  val is_repeated = descriptor_responseReg.is_repeated
-
-  val type_varint64 = (type_info === PROTO_TYPES.TYPE_INT64) || (type_info === PROTO_TYPES.TYPE_UINT64) || (type_info === PROTO_TYPES.TYPE_SINT64)
-  val type_bool = (type_info === PROTO_TYPES.TYPE_BOOL)
-  val type_need_zigzag64 = (type_info === PROTO_TYPES.TYPE_SINT64)
-  val type_need_zigzag32 = (type_info === PROTO_TYPES.TYPE_SINT32)
-
-  io.fixed_writer_request.valid := Bool(false)
-
-
-  val varint_zigzag32_result = (varintresult(31, 0) >> 1) ^ ((~(varintresult(31, 0) & 1.U)) + 1.U)
-  val varint_zigzag64_result = (varintresult >> 1) ^ ((~(varintresult & 1.U)) + 1.U)
-
-  val fixed_alloc_region_next = RegInit(0.U(64.W))
-  when (io.fixed_alloc_region_addr.valid) {
-    fixed_alloc_region_next := io.fixed_alloc_region_addr.bits
-  }
-  assert((fixed_alloc_region_next & UInt(0x7)) === UInt(0), "Fixed alloc region ptr must be 8-byte aligned\n")
-
-  val array_alloc_region_next = RegInit(0.U(64.W))
-  when (io.array_alloc_region_addr.valid) {
-    array_alloc_region_next := io.array_alloc_region_addr.bits
-  }
-  assert((array_alloc_region_next & UInt(0x7)) === UInt(0), "Array alloc region ptr must be 8-byte aligned\n")
-
-
-
-
-  val sStringWait = UInt(0)
-  val sStringReadLength = UInt(1)
-  val sStringWriteHeader0 = UInt(2)
-  val sStringWriteHeader1 = UInt(3)
-  val sStringMoveData = UInt(4)
-  val sStringDone = UInt(5)
-  val stringFieldState = RegInit(sStringWait)
-
-  val sPackedRepeatedWait = UInt(0)
-  val sPackedRepeatedReadByteLength = UInt(1)
-  val sPackedRepeatedMoveData = UInt(2)
-  val sPackedRepeatedWriteHeader = UInt(3)
-  val packedRepeatedFieldState = RegInit(sPackedRepeatedWait)
-
-  val sNestedMessageWait = UInt(0)
-  val sGetDescrTableAddr = UInt(1)
-  val sLoadVPtr = UInt(2)
-  val sObjLenStackManagement = UInt(3)
-  val switchNestedMessageSetupState = RegInit(sNestedMessageWait)
-
-
-  val urc_valid = RegInit(Bool(false))
-
-  val urc_ptr_to_repeated_field = RegInit(0.U(64.W))
-  val urc_is_repeated_ptr_field = RegInit(0.B)
-
-  val urc_ptr_to_inobjsizes = RegInit(0.U(64.W))
-
-  val urc_ptr_to_repobjsizes = RegInit(0.U(64.W))
-
-  val urc_next_write_addr = RegInit(0.U(64.W))
-  val urc_elems_written = RegInit(0.U(64.W))
-
-  val urc_alloc_stage = RegInit(0.U(2.W))
-  val urc_teardown_stage = RegInit(0.U(2.W))
-
-
-  val hasbitswriter = Module(new HasBitsWriter)
-  io.l1helperUser2 <> hasbitswriter.io.l1helperUser
-  hasbitswriter.io.requestin.valid := false.B
-  hasbitswriter.io.requestin.bits.flushonly := false.B
-
-  val fire_sReadKey = DecoupledHelper(
-    descriptor_table_handler.io.field_dest_request.ready,
-    io.consumer.output_valid,
-    hasbitswriter.io.requestin.ready
+  val data_encoder = Module(new CombinationalVarintEncode)
+  data_encoder.io.inputData := Mux(varintDataUnsigned,
+                                          mem_resp_raw,
+                                          Mux(varintData64bit,
+                                            mem_resp_zigzag64,
+                                            mem_resp_zigzag32)
   )
 
-  switch (fieldState) {
-    is (sReadKey) {
-      io.consumer.user_consumed_bytes := varintlen
-      io.consumer.output_ready := fire_sReadKey.fire(io.consumer.output_valid)
-      descriptor_table_handler.io.field_dest_request.valid := fire_sReadKey.fire(descriptor_table_handler.io.field_dest_request.ready)
-      hasbitswriter.io.requestin.valid := fire_sReadKey.fire(hasbitswriter.io.requestin.ready)
+  val string_obj_ptr_reg = RegInit(0.U(64.W))
+  val string_data_ptr_reg = RegInit(0.U(64.W))
+  val string_length_no_null_term = RegInit(0.U(64.W))
 
-      hasbitswriter.io.requestin.bits.hasbits_base_addr := current_out_addr + current_hasbits_offset
-      hasbitswriter.io.requestin.bits.relative_fieldno := field_no - current_min_field_no
-      hasbitswriter.io.requestin.bits.flushonly := false.B
+  val encoded_string_length_no_null_term_reg = Reg(UInt())
+  val encoded_string_length_no_null_term_bytes_reg = Reg(UInt())
 
-      when (fire_sReadKey.fire()) {
-        ProtoaccLogger.logInfo("Read Key. fieldno: %d, wire_type: %d\n", field_no, wire_type)
-        fieldState := sPrepState
-        field_no_reg := field_no
-        wireTypeReg := wire_type
-        just_completed_buffer := Bool(false)
-      } .elsewhen (just_completed_buffer) {
-        hasbitswriter.io.requestin.valid := true.B
-        hasbitswriter.io.requestin.bits.flushonly := true.B
-        when (hasbitswriter.io.requestin.ready) {
-          just_completed_buffer := Bool(false)
-        }
-      }
-    }
-    is (sPrepState) {
-      descriptor_table_handler.io.field_dest_response.ready := Bool(true)
-      when (descriptor_table_handler.io.field_dest_response.valid) {
-        val descr_resp_bits = descriptor_table_handler.io.field_dest_response.bits
-        descriptor_responseReg := descr_resp_bits
+  val base_addr_bytes_aligned_reg = RegInit(0.U(64.W))
+  val words_to_load_reg = RegInit(0.U(64.W))
+  val words_to_load_minus_one_reg = RegInit(0.U(64.W))
+  val words_to_load_minus_one_reg_fixed = RegInit(0.U(64.W))
+  val base_addr_start_index_reg = RegInit(0.U(log2Up(16+1).W))
+  val base_addr_end_index_inclusive_reg = RegInit(0.U(log2Up(16+1).W))
+  val base_addr_end_index_reg = RegInit(0.U(log2Up(16+1).W))
+
+  val string_load_respcounter = RegInit(0.U(64.W))
 
 
-        val unpacked_repeated = descr_resp_bits.is_repeated && (
-          (!(wireTypeReg === sHandleLengthDelim)) || (
-            descr_resp_bits.proto_field_type === PROTO_TYPES.TYPE_STRING ||
-            descr_resp_bits.proto_field_type === PROTO_TYPES.TYPE_BYTES ||
-            descr_resp_bits.proto_field_type === PROTO_TYPES.TYPE_MESSAGE))
+  val repeated_elems_headptr = RegInit(0.U(64.W))
 
-        descriptor_responseReg_extra.unpacked_repeated := unpacked_repeated
-        descriptor_responseReg_extra.is_repeated_ptr_field :=
-            descr_resp_bits.is_repeated && (
-            descr_resp_bits.proto_field_type === PROTO_TYPES.TYPE_STRING ||
-            descr_resp_bits.proto_field_type === PROTO_TYPES.TYPE_BYTES ||
-            descr_resp_bits.proto_field_type === PROTO_TYPES.TYPE_MESSAGE)
 
-        descriptor_responseReg_extra.ptr_to_repeated_field := descr_resp_bits.write_addr - 8.U
+  val S_WAIT_CMD = 0.U
+  val S_SCALAR_DISPATCH_REQ = 1.U
+  val S_SCALAR_OUTPUT_DATA = 2.U
+  val S_WRITE_KEY = 3.U
 
-        descriptor_responseReg_extra.ptr_to_repeated_field_sizes := descr_resp_bits.write_addr - 8.U
-        descriptor_responseReg_extra.ptr_to_repeated_field_elems := descr_resp_bits.write_addr
-        descriptor_responseReg_extra.ptr_to_repeated_ptr_field_sizes := descr_resp_bits.write_addr
-        descriptor_responseReg_extra.ptr_to_repeated_ptr_field_rep := descr_resp_bits.write_addr + 8.U
+  val S_STRING_GETPTR = 4.U
+  val S_STRING_GETHEADER1 = 5.U
+  val S_STRING_GETHEADER2 = 6.U
+  val S_STRING_RECVHEADER1 = 7.U
+  val S_STRING_RECVHEADER2 = 8.U
+  val S_STRING_LOADDATA = 9.U
+  val S_STRING_WRITEKEY = 10.U
 
-        when (unpacked_repeated) {
-          fieldState := sManageRepeatedAlloc
+
+  val S_UNPACKED_REP_GETPTR = 11.U
+  val S_UNPACKED_REP_GETSIZE = 12.U
+  val S_UNPACKED_REP_RECVPTR = 13.U
+  val S_UNPACKED_REP_RECVSIZE = 14.U
+
+
+  val handlerState = RegInit(S_WAIT_CMD)
+
+  switch (handlerState) {
+    is (S_WAIT_CMD) {
+      when (io.ops_in.bits.end_of_message === true.B) {
+
+        outputQ.io.enq.valid := io.ops_in.valid
+
+        outputQ.io.enq.bits.data := 0.U
+        outputQ.io.enq.bits.validbytes := 0.U
+        outputQ.io.enq.bits.depth := io.ops_in.bits.depth
+        outputQ.io.enq.bits.end_of_message := true.B
+
+        when (io.ops_in.bits.depth =/= 1.U) {
+          outputQ.io.enq.bits.last_for_arbitration_round := false.B
+          when (io.ops_in.valid && outputQ.io.enq.ready) {
+            ProtoaccLogger.logInfo(logPrefix + " S_WAIT_CMD: EOM zerofield passthrough for submessage.\n")
+            handlerState := S_WRITE_KEY
+
+            encoded_key_reg := key_encoder.io.outputData
+            encoded_key_bytes_reg := key_encoder.io.outputBytes
+          }
         } .otherwise {
-          fieldState := wireTypeReg
-        }
-      }
-    }
-    is (sManageRepeatedAlloc) {
-      when (urc_valid) {
-        when (urc_ptr_to_repeated_field ===
-                descriptor_responseReg_extra.ptr_to_repeated_field) {
-          descriptor_responseReg.write_addr := urc_next_write_addr
-          fieldState := wireTypeReg
-          ProtoaccLogger.logInfo("[unpacked repeat] continuing. waddr will be: 0x%x, elems written: 0x%x\n",
-            urc_next_write_addr,
-            urc_elems_written)
-        } .otherwise {
-
-          when (urc_is_repeated_ptr_field) {
-            when (urc_teardown_stage === 0.U) {
-              io.fixed_writer_request.bits.write_data := ((urc_elems_written << 32) | urc_elems_written(31, 0))(63, 0)
-              io.fixed_writer_request.valid := Bool(true)
-              io.fixed_writer_request.bits.write_addr := urc_ptr_to_inobjsizes
-              io.fixed_writer_request.bits.write_width := 3.U
-
-              when (io.fixed_writer_request.ready) {
-                ProtoaccLogger.logInfo("[unpacked repptrfield] closeout s0\n")
-                urc_teardown_stage := 1.U
-              }
-            } .otherwise {
-              io.fixed_writer_request.bits.write_data := urc_elems_written
-              io.fixed_writer_request.valid := Bool(true)
-              io.fixed_writer_request.bits.write_addr := urc_ptr_to_repobjsizes
-              io.fixed_writer_request.bits.write_width := 3.U
-
-              when (io.fixed_writer_request.ready) {
-                ProtoaccLogger.logInfo("[unpacked repptrfield] closeout s1\n")
-                urc_valid := Bool(false)
-                array_alloc_region_next := ((urc_next_write_addr + 7.U) >> 3.U) << 3.U
-                urc_teardown_stage := 0.U
-              }
-            }
-          } .otherwise {
-            io.fixed_writer_request.bits.write_data := ((urc_elems_written << 32) | urc_elems_written(31, 0))(63, 0)
-            io.fixed_writer_request.valid := Bool(true)
-            io.fixed_writer_request.bits.write_addr := urc_ptr_to_inobjsizes
-            io.fixed_writer_request.bits.write_width := 3.U
-
-            when (io.fixed_writer_request.ready) {
-              ProtoaccLogger.logInfo("[unpacked repfield] closeout\n")
-
-              urc_valid := Bool(false)
-              array_alloc_region_next := ((urc_next_write_addr + 7.U) >> 3.U) << 3.U
-            }
+          io.ops_in.ready := outputQ.io.enq.ready
+          outputQ.io.enq.bits.last_for_arbitration_round := true.B
+          when (io.ops_in.valid && outputQ.io.enq.ready) {
+            ProtoaccLogger.logInfo(logPrefix + " S_WAIT_CMD: EOM zerofield passthrough for top-level message.\n")
           }
         }
+
+      } .elsewhen (io.ops_in.valid) {
+
+        wire_type_reg := wire_type
+        cpp_size_log2_reg := cpp_size_log2
+        is_varint_signed_reg := is_varint_signed
+        is_int32_reg := is_int32
+        detailedTypeIsPotentiallyScalar_reg := detailedTypeIsPotentiallyScalar
+
+        encoded_key_reg := key_encoder.io.outputData
+        encoded_key_bytes_reg := key_encoder.io.outputBytes
+
+        src_data_addr_reg := io.ops_in.bits.src_data_addr
+
+        // Invalid for some reason:
+        // ProtoaccLogger.logInfo(logPrefix + " S_WAIT_CMD: accept op: src_data_addr 0x%x, src_data_type %d, is_repeated 0x%x, is_packed 0x%x, field_number %d, wire_type %d, cpp_size_log2 %d, is_varint_signed %d\n",
+        //   Wire(io.ops_in.bits.src_data_addr),
+        //   Wire(io.ops_in.bits.src_data_type),
+        //   Wire(is_repeated),
+        //   Wire(is_packed),
+        //   Wire(io.ops_in.bits.field_number),
+        //   Wire(wire_type),
+        //   Wire(cpp_size_log2),
+        //   Wire(is_varint_signed)
+        // )
+
+
+        when (detailedTypeIsPotentiallyScalar && !is_repeated) {
+          ProtoaccLogger.logInfo(logPrefix + " S_WAIT_CMD: moving to handle scalar\n")
+          handlerState := S_SCALAR_DISPATCH_REQ
+        } .elsewhen (is_bytes_or_string && !is_repeated) {
+          ProtoaccLogger.logInfo(logPrefix + " S_WAIT_CMD: moving to handle string/bytes\n")
+          handlerState := S_STRING_GETPTR
+        } .elsewhen ((detailedTypeIsPotentiallyScalar || is_bytes_or_string) && is_repeated) {
+          ProtoaccLogger.logInfo(logPrefix + " S_WAIT_CMD: moving to setup unpacked repeated\n")
+          handlerState := S_UNPACKED_REP_GETPTR
+        } .otherwise {
+          assert(false.B, "not yet implemented")
+        }
+
+      }
+    }
+
+    is (S_SCALAR_DISPATCH_REQ) {
+      ProtoaccLogger.logInfo(logPrefix + " S_SCALAR_DISPATCH_REQ: loading scalar\n")
+
+      io.memread.req.bits.addr := src_data_addr_reg
+      io.memread.req.bits.size := cpp_size_log2_reg
+      io.memread.req.valid := true.B
+      when (io.memread.req.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_SCALAR_DISPATCH_REQ: dispatched scalarload req: addr 0x%x, size 0x%x\n",
+          io.memread.req.bits.addr,
+          io.memread.req.bits.size)
+
+        handlerState := S_SCALAR_OUTPUT_DATA
+      }
+    }
+
+    is (S_SCALAR_OUTPUT_DATA) {
+      io.memread.resp.ready := outputQ.io.enq.ready
+      outputQ.io.enq.valid := io.memread.resp.valid
+
+      outputQ.io.enq.bits.data := mem_resp_raw
+      outputQ.io.enq.bits.last_for_arbitration_round := false.B
+      outputQ.io.enq.bits.validbytes := cpp_size_nonlog2_fromreg
+      outputQ.io.enq.bits.depth := io.ops_in.bits.depth
+      outputQ.io.enq.bits.end_of_message := false.B
+
+      when (wire_type_reg === WIRE_TYPES.WIRE_TYPE_VARINT) {
+        outputQ.io.enq.bits.data := data_encoder.io.outputData
+        outputQ.io.enq.bits.validbytes := data_encoder.io.outputBytes
+      }
+
+      when (io.memread.resp.valid && outputQ.io.enq.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_SCALAR_OUTPUT_DATA: loaded_val 0x%x, read_mask 0x%x, encoded_val 0x%x, output size bytes %d, last 0x%x\n",
+         mem_resp_raw,
+         read_mask,
+         outputQ.io.enq.bits.data,
+         outputQ.io.enq.bits.validbytes,
+         outputQ.io.enq.bits.last_for_arbitration_round)
+
+        when (!(is_repeated && is_packed)) {
+          ProtoaccLogger.logInfo(logPrefix + " S_SCALAR_OUTPUT_DATA: nonrepeated or unpacked repeated\n")
+          handlerState := S_WRITE_KEY
+        } .otherwise {
+          when (src_data_addr_reg === repeated_elems_headptr) {
+            ProtoaccLogger.logInfo(logPrefix + " S_SCALAR_OUTPUT_DATA: packed repeated lastelem\n")
+
+            repeated_elems_headptr := 0.U
+            handlerState := S_WRITE_KEY
+          } .otherwise {
+            val nextptr = src_data_addr_reg - cpp_size_nonlog2_fromreg
+            ProtoaccLogger.logInfo(logPrefix + " S_SCALAR_OUTPUT_DATA: packed repeated continue, nextptr: 0x%x\n",
+              nextptr)
+            src_data_addr_reg := nextptr
+            handlerState := S_SCALAR_DISPATCH_REQ
+          }
+        }
+      }
+    }
+
+    is (S_WRITE_KEY) {
+      ProtoaccLogger.logInfo(logPrefix + " S_WRITE_KEY\n")
+
+
+      outputQ.io.enq.bits.data := encoded_key_reg
+      outputQ.io.enq.bits.validbytes := encoded_key_bytes_reg
+      outputQ.io.enq.bits.depth := io.ops_in.bits.depth
+      outputQ.io.enq.bits.end_of_message := io.ops_in.bits.end_of_message
+
+
+      outputQ.io.enq.valid := true.B
+
+
+      val is_unpacked_repeated = is_repeated && !is_packed
+      when (outputQ.io.enq.ready) {
+        when (!is_unpacked_repeated) {
+          ProtoaccLogger.logInfo(logPrefix + " S_WRITE_KEY: nonrepeated\n")
+          outputQ.io.enq.bits.last_for_arbitration_round := true.B
+          handlerState := S_WAIT_CMD
+          io.ops_in.ready := true.B
+        } .otherwise {
+          when (src_data_addr_reg === repeated_elems_headptr) {
+            ProtoaccLogger.logInfo(logPrefix + " S_WRITE_KEY: unpacked repeated lastelem\n")
+
+            repeated_elems_headptr := 0.U
+            outputQ.io.enq.bits.last_for_arbitration_round := true.B
+            handlerState := S_WAIT_CMD
+            io.ops_in.ready := true.B
+          } .otherwise {
+            val nextptr = src_data_addr_reg - cpp_size_nonlog2_fromreg
+            ProtoaccLogger.logInfo(logPrefix + " S_WRITE_KEY: unpacked repeated continue, nextptr: 0x%x\n",
+              nextptr)
+            src_data_addr_reg := nextptr
+            outputQ.io.enq.bits.last_for_arbitration_round := false.B
+            handlerState := S_SCALAR_DISPATCH_REQ
+            io.ops_in.ready := false.B
+          }
+        }
+
+        ProtoaccLogger.logInfo(logPrefix + " S_WRITE_KEY: encoded key 0x%x, key size %d, last 0x%x\n",
+         outputQ.io.enq.bits.data,
+         outputQ.io.enq.bits.validbytes,
+         outputQ.io.enq.bits.last_for_arbitration_round)
+
+      }
+    }
+    // Obtaining string from ArenaStringPtr (only has one member ptr_ that holds a std::string)
+    is (S_STRING_GETPTR) {
+      ProtoaccLogger.logInfo(logPrefix + " S_STRING_GETPTR: loading stringptr\n")
+
+      io.memread.req.bits.addr := src_data_addr_reg // ptr to a string ptr (so this gets the value of the string ptr)
+      io.memread.req.bits.size := cpp_size_log2_reg
+      io.memread.req.valid := true.B
+      when (io.memread.req.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_STRING_GETPTR: getting string ptr from: addr 0x%x, size 0x%x\n",
+          io.memread.req.bits.addr,
+          io.memread.req.bits.size)
+
+        handlerState := S_STRING_GETHEADER1
+      }
+    }
+    is (S_STRING_GETHEADER1) {
+      ProtoaccLogger.logInfo(logPrefix + " S_STRING_GETHEADER1: stringptr resp, header read1\n")
+
+      io.memread.resp.ready := io.memread.req.ready
+      io.memread.req.valid := io.memread.resp.valid
+
+      // this gets the 1st part of the string object
+      val masked_str_ptr = io.memread.resp.bits.data & ~(3.U(io.memread.resp.bits.data.getWidth.W)) // NOTE: New "tagged string" has values in bottom 2 bits that need clearing
+
+      io.memread.req.bits.addr := masked_str_ptr
+      io.memread.req.bits.size := 3.U
+
+      when (io.memread.resp.valid && io.memread.req.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_STRING_GETHEADER1: getting string header from: addr 0x%x, size 0x%x\n",
+          io.memread.req.bits.addr,
+          io.memread.req.bits.size)
+
+        string_obj_ptr_reg := masked_str_ptr
+        handlerState := S_STRING_GETHEADER2
+      }
+    }
+    is (S_STRING_GETHEADER2) {
+      ProtoaccLogger.logInfo(logPrefix + " S_STRING_GETHEADER2: get header pt 2\n")
+      io.memread.req.valid := true.B
+      io.memread.req.bits.addr := string_obj_ptr_reg + 8.U // this gets the 2nd part
+      io.memread.req.bits.size := 3.U
+      when (io.memread.req.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_STRING_GETHEADER2: getting string header pt.2 from: addr 0x%x, size 0x%x\n",
+          io.memread.req.bits.addr,
+          io.memread.req.bits.size)
+        handlerState := S_STRING_RECVHEADER1
+      }
+    }
+    is (S_STRING_RECVHEADER1) {
+      ProtoaccLogger.logInfo(logPrefix + " S_STRING_RECVHEADER1: recv header pt 1\n")
+
+      io.memread.resp.ready := true.B
+      when (io.memread.resp.valid) {
+        ProtoaccLogger.logInfo(logPrefix + " S_STRING_RECVHEADER1: got string header pt1 value: 0x%x\n",
+          io.memread.resp.bits.data)
+
+        string_data_ptr_reg := io.memread.resp.bits.data
+        handlerState := S_STRING_RECVHEADER2
+      }
+    }
+    is (S_STRING_RECVHEADER2) {
+      io.memread.resp.ready := true.B
+      ProtoaccLogger.logInfo(logPrefix + " S_STRING_RECVHEADER2: recv header pt 2\n")
+
+
+
+      val base_addr_bytes = string_data_ptr_reg
+      val base_len = io.memread.resp.bits.data
+      val base_addr_start_index = base_addr_bytes & UInt(0xF)
+      val aligned_loadlen = base_len + base_addr_start_index
+      val base_addr_end_index = aligned_loadlen & UInt(0xF)
+      val base_addr_end_index_inclusive = (aligned_loadlen - 1.U) & UInt(0xF)
+      val extra_word = ((aligned_loadlen & UInt(0xF)) =/= UInt(0)).asUInt
+
+      val base_addr_bytes_aligned = (base_addr_bytes >> 4) << 4
+      val words_to_load = (aligned_loadlen >> 4) + extra_word
+      val words_to_load_minus_one = words_to_load - 1.U
+
+      val len_encoder = Module(new CombinationalVarintEncode)
+      len_encoder.io.inputData := base_len
+
+      when (io.memread.resp.valid) {
+        //ProtoaccLogger.logInfo(logPrefix + " S_STRING_RECVHEADER2: got string header pt2 value: 0x%x\n",
+        //  io.memread.resp.bits.data)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: base_addr_bytes: %x\n", base_addr_bytes)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: base_len: %x\n", base_len)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: base_addr_start_index: %x\n", base_addr_start_index)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: aligned_loadlen: %x\n", aligned_loadlen)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: base_addr_end_index: %x\n", base_addr_end_index)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: base_addr_end_index_inclusive: %x\n", base_addr_end_index_inclusive)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: extra_word: %x\n", extra_word)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: base_addr_bytes_aligned: %x\n", base_addr_bytes_aligned)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: words_to_load: %x\n", words_to_load)
+        //ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2: words_to_load_minus_one: %x\n", words_to_load_minus_one)
+
+        ProtoaccLogger.logInfo(logPrefix + "S_STRING_RECVHEADER2:\n"
+         + "  got string header pt2 value: 0x%x\n"
+         + "  base_addr_bytes: %x\n"
+         + "  base_len: %x\n"
+         + "  base_addr_start_index: %x\n"
+         + "  aligned_loadlen: %x\n"
+         + "  base_addr_end_index: %x\n"
+         + "  base_addr_end_index_inclusive: %x\n"
+         + "  extra_word: %x\n"
+         + "  base_addr_bytes_aligned: %x\n"
+         + "  words_to_load: %x\n"
+         + "  words_to_load_minus_one: %x\n",
+         io.memread.resp.bits.data
+         , base_addr_bytes
+         , base_len
+         , base_addr_start_index
+         , aligned_loadlen
+         , base_addr_end_index
+         , base_addr_end_index_inclusive
+         , extra_word
+         , base_addr_bytes_aligned
+         , words_to_load
+         , words_to_load_minus_one)
+
+        string_length_no_null_term := base_len
+        encoded_string_length_no_null_term_reg := len_encoder.io.outputData
+        encoded_string_length_no_null_term_bytes_reg := len_encoder.io.outputBytes
+
+
+        base_addr_bytes_aligned_reg := base_addr_bytes_aligned
+        words_to_load_reg := words_to_load
+        words_to_load_minus_one_reg := words_to_load_minus_one
+        words_to_load_minus_one_reg_fixed := words_to_load_minus_one
+
+        base_addr_start_index_reg := base_addr_start_index
+        base_addr_end_index_inclusive_reg := base_addr_end_index_inclusive
+        base_addr_end_index_reg := base_addr_end_index
+
+
+        handlerState := S_STRING_LOADDATA
+      }
+
+    }
+
+    is (S_STRING_LOADDATA) {
+      ProtoaccLogger.logInfo(logPrefix + " S_STRING_LOADDATA\n")
+
+      io.memread.req.bits.addr := base_addr_bytes_aligned_reg + (words_to_load_minus_one_reg << 4)
+      io.memread.req.valid := words_to_load_reg =/= 0.U
+      io.memread.req.bits.size := 4.U
+      when (words_to_load_reg =/= 0.U && io.memread.req.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_STRING_LOADDATA. doing load. addr 0x%x, size %d\n",
+         io.memread.req.bits.addr, io.memread.req.bits.size)
+        words_to_load_reg := words_to_load_reg - 1.U
+        words_to_load_minus_one_reg := words_to_load_minus_one_reg - 1.U
+      }
+
+      val handlingtail = string_load_respcounter === 0.U
+      val handlingfront = string_load_respcounter === words_to_load_minus_one_reg_fixed
+
+      outputQ.io.enq.bits.data := Mux(handlingfront,
+        io.memread.resp.bits.data >> (base_addr_start_index_reg << 3),
+        io.memread.resp.bits.data)
+      outputQ.io.enq.bits.last_for_arbitration_round := false.B
+      when (handlingfront && handlingtail) {
+        outputQ.io.enq.bits.validbytes := (base_addr_end_index_inclusive_reg - base_addr_start_index_reg) +& 1.U
+      } .elsewhen (handlingtail) {
+        outputQ.io.enq.bits.validbytes := (base_addr_end_index_inclusive_reg +& 1.U)
+      } .elsewhen (handlingfront) {
+        outputQ.io.enq.bits.validbytes := 16.U - base_addr_start_index_reg
       } .otherwise {
+        outputQ.io.enq.bits.validbytes := 16.U
+      }
 
-          when (descriptor_responseReg_extra.is_repeated_ptr_field) {
-            when (urc_alloc_stage === 0.U) {
-              io.fixed_writer_request.valid := Bool(true)
-              io.fixed_writer_request.bits.write_addr := descriptor_responseReg_extra.ptr_to_repeated_ptr_field_rep
-              io.fixed_writer_request.bits.write_width := 3.U
-              io.fixed_writer_request.bits.write_data := array_alloc_region_next
+      outputQ.io.enq.bits.depth := io.ops_in.bits.depth
+      outputQ.io.enq.bits.end_of_message := false.B
 
-              when (io.fixed_writer_request.ready) {
-                urc_next_write_addr := array_alloc_region_next + 8.U
-                urc_valid := Bool(true)
+      outputQ.io.enq.valid := io.memread.resp.valid
+      io.memread.resp.ready := outputQ.io.enq.ready
+      when (outputQ.io.enq.ready && io.memread.resp.valid) {
+        ProtoaccLogger.logInfo(logPrefix + " S_STRING_LOADDATA: \n"
+          + "  got resp. string_load_respcounter 0x%x, raw resp: 0x%x\n"
+          + "  enq out. data 0x%x, last_for_arb 0x%x, validbytes %d, depth %d, end_of_message %d\n",
+          string_load_respcounter, io.memread.resp.bits.data,
+          outputQ.io.enq.bits.data,
+          outputQ.io.enq.bits.last_for_arbitration_round,
+          outputQ.io.enq.bits.validbytes,
+          outputQ.io.enq.bits.depth,
+          outputQ.io.enq.bits.end_of_message)
 
-                descriptor_responseReg.write_addr := array_alloc_region_next + 8.U
-
-                urc_alloc_stage := 1.U
-                ProtoaccLogger.logInfo("[unpacked repptrfield] starting s0. rep_ obj will be at 0x%x\n",
-                  array_alloc_region_next)
-
-                urc_ptr_to_repeated_field := descriptor_responseReg_extra.ptr_to_repeated_field
-                urc_is_repeated_ptr_field := Bool(true)
-                urc_ptr_to_inobjsizes := descriptor_responseReg_extra.ptr_to_repeated_ptr_field_sizes
-                urc_ptr_to_repobjsizes := array_alloc_region_next
-
-                urc_elems_written := 0.U
-                urc_alloc_stage := 0.U
-                urc_teardown_stage := 0.U
-
-                fieldState := wireTypeReg
-
-
-              }
-            }
-          } .otherwise {
-            io.fixed_writer_request.valid := Bool(true)
-            io.fixed_writer_request.bits.write_addr := descriptor_responseReg_extra.ptr_to_repeated_field_elems
-            io.fixed_writer_request.bits.write_width := 3.U
-            io.fixed_writer_request.bits.write_data := array_alloc_region_next
-
-            when (io.fixed_writer_request.ready) {
-
-              descriptor_responseReg.write_addr := array_alloc_region_next
-
-              urc_valid := Bool(true)
-              urc_ptr_to_repeated_field := descriptor_responseReg_extra.ptr_to_repeated_field
-              urc_is_repeated_ptr_field := Bool(false)
-              urc_ptr_to_inobjsizes := descriptor_responseReg_extra.ptr_to_repeated_field_sizes
-              urc_ptr_to_repobjsizes := 0.U
-
-              urc_next_write_addr := array_alloc_region_next
-              urc_elems_written := 0.U
-              urc_alloc_stage := 0.U
-              urc_teardown_stage := 0.U
-              ProtoaccLogger.logInfo("[unpacked repfield] starting. waddr will be 0x%x\n",
-                array_alloc_region_next)
-
-              fieldState := wireTypeReg
-            }
-          }
-
+        when (handlingfront) {
+          handlerState := S_STRING_WRITEKEY
+          string_load_respcounter := 0.U
+        } .otherwise {
+          string_load_respcounter := string_load_respcounter + 1.U
+        }
       }
     }
+    is (S_STRING_WRITEKEY) {
 
 
-    is (sHandleVarint) {
-      io.consumer.user_consumed_bytes := varintlen
-      io.consumer.output_ready := io.fixed_writer_request.ready
-      io.fixed_writer_request.valid := io.consumer.output_valid
+      outputQ.io.enq.valid := true.B
 
-      io.fixed_writer_request.bits.write_width := Mux(type_varint64,
-                                                    UInt(3),
-                                                    Mux(type_bool,
-                                                      UInt(0),
-                                                      UInt(2)))
+      ProtoaccLogger.logInfo(logPrefix + " S_STRING_WRITEKEY:\n"
+        + "  encoded_key 0x%x, encoded_key_bytes 0x%x\n"
+        + "  encoded_len 0x%x, encoded_len_bytes 0x%x\n",
+        encoded_key_reg,
+        encoded_key_bytes_reg,
+        encoded_string_length_no_null_term_reg,
+        encoded_string_length_no_null_term_bytes_reg)
 
-      when (type_need_zigzag64) {
-        io.fixed_writer_request.bits.write_data := varint_zigzag64_result
-      } .elsewhen (type_need_zigzag32) {
-        io.fixed_writer_request.bits.write_data := varint_zigzag32_result
+      outputQ.io.enq.bits.data := encoded_key_reg | (encoded_string_length_no_null_term_reg << (encoded_key_bytes_reg << 3))
+      outputQ.io.enq.bits.last_for_arbitration_round := true.B
+      outputQ.io.enq.bits.validbytes := encoded_key_bytes_reg +& encoded_string_length_no_null_term_bytes_reg
+      outputQ.io.enq.bits.depth := io.ops_in.bits.depth
+      outputQ.io.enq.bits.end_of_message := false.B
+
+      val is_unpacked_repeated = is_repeated && !is_packed
+      when (outputQ.io.enq.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_STRING_WRITEKEY enq out. data 0x%x, last_for_arb 0x%x, validbytes %d, depth %d, end_of_message %d\n",
+          outputQ.io.enq.bits.data,
+          outputQ.io.enq.bits.last_for_arbitration_round,
+          outputQ.io.enq.bits.validbytes,
+          outputQ.io.enq.bits.depth,
+          outputQ.io.enq.bits.end_of_message)
+
+        when (!is_unpacked_repeated) {
+          io.ops_in.ready := true.B
+          handlerState := S_WAIT_CMD
+        } .otherwise {
+          when (src_data_addr_reg === repeated_elems_headptr) {
+            ProtoaccLogger.logInfo(logPrefix + " S_STRING_WRITEKEY: unpacked repeated lastelem\n")
+
+            repeated_elems_headptr := 0.U
+            outputQ.io.enq.bits.last_for_arbitration_round := true.B
+            handlerState := S_WAIT_CMD
+            io.ops_in.ready := true.B
+          } .otherwise {
+            val nextptr = src_data_addr_reg - cpp_size_nonlog2_fromreg
+            ProtoaccLogger.logInfo(logPrefix + " S_STRING_WRITEKEY: unpacked repeated continue, nextptr: 0x%x\n",
+              nextptr)
+            src_data_addr_reg := nextptr
+            outputQ.io.enq.bits.last_for_arbitration_round := false.B
+            handlerState := S_STRING_GETPTR
+            io.ops_in.ready := false.B
+          }
+        }
+      }
+
+    }
+
+    // Following states read the Repeated{Ptr}Field object (with different internal elements)
+    is (S_UNPACKED_REP_GETPTR) {
+      ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_GETPTR: req ptr to unpacked elems\n")
+
+      io.memread.req.valid := true.B
+
+      // src_data_addr_reg points to the C++ object + 8B (why... idk... but it does)
+      when (is_bytes_or_string) {
+        io.memread.req.bits.addr := src_data_addr_reg - 8.U // (in old code: this points to rep_ (which has the void* inside of it))
       } .otherwise {
-        io.fixed_writer_request.bits.write_data := varintresult
+        io.memread.req.bits.addr := src_data_addr_reg // (in old code: this points to arena_or_elements_)
       }
 
-      when (io.consumer.output_valid && io.fixed_writer_request.ready) {
-        when (descriptor_responseReg.is_repeated) {
-          urc_next_write_addr := urc_next_write_addr + (1.U(64.W) << io.fixed_writer_request.bits.write_width)
-          urc_elems_written := urc_elems_written + 1.U
-        }
-        ProtoaccLogger.logInfo("Handle Varint. fieldno: %d, value: 0x%x\n", field_no_reg, varintresult)
-        ProtoaccLogger.logInfo("Handle Varint. is_repeated: %d, type: %d, waddr: 0x%x\n",
-          is_repeated, type_info, io.fixed_writer_request.bits.write_addr)
-        when (urc_valid && last_consumer_transaction) {
-          fieldState := sEndBufCloseurcArray
-        } .otherwise {
-          fieldState := sReadKey
-        }
+      io.memread.req.bits.size := 3.U
+
+      when (io.memread.req.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_GETPTR: req ptr to unpacked elems from: addr 0x%x, read size 0x%x\n",
+          io.memread.req.bits.addr,
+          io.memread.req.bits.size)
+        handlerState := S_UNPACKED_REP_GETSIZE
       }
     }
-    is (sHandle64bit) {
-      io.consumer.user_consumed_bytes := UInt(8)
-      io.consumer.output_ready := io.fixed_writer_request.ready
-      io.fixed_writer_request.bits.write_width := UInt(3)
+    is (S_UNPACKED_REP_GETSIZE) {
+      ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_GETSIZE: req size of unpacked\n")
 
+      io.memread.req.valid := true.B
 
-      val result64 = io.consumer.output_data(63, 0)
-      io.fixed_writer_request.bits.write_data := result64
-      io.fixed_writer_request.valid := io.consumer.output_valid
-
-      when (io.consumer.output_valid && io.fixed_writer_request.ready) {
-        when (descriptor_responseReg.is_repeated) {
-          urc_next_write_addr := urc_next_write_addr + (1.U(64.W) << io.fixed_writer_request.bits.write_width)
-          urc_elems_written := urc_elems_written + 1.U
-        }
-
-        ProtoaccLogger.logInfo("Handle 64bit. fieldno: %d, value: 0x%x\n", field_no_reg, result64)
-        ProtoaccLogger.logInfo("Handle 64bit. is_repeated: %d, type: %d, waddr: 0x%x\n",
-          is_repeated, type_info, io.fixed_writer_request.bits.write_addr)
-
-        when (urc_valid && last_consumer_transaction) {
-          fieldState := sEndBufCloseurcArray
-        } .otherwise {
-          fieldState := sReadKey
-        }
-
-      }
-    }
-
-    is (sHandle32bit) {
-      io.consumer.user_consumed_bytes := UInt(4)
-      io.consumer.output_ready := io.fixed_writer_request.ready
-      io.fixed_writer_request.bits.write_width := UInt(2)
-      val result32 = io.consumer.output_data(31, 0)
-      io.fixed_writer_request.bits.write_data := result32
-      io.fixed_writer_request.valid := io.consumer.output_valid
-
-      when (io.consumer.output_valid && io.fixed_writer_request.ready) {
-        when (descriptor_responseReg.is_repeated) {
-          urc_next_write_addr := urc_next_write_addr + (1.U(64.W) << io.fixed_writer_request.bits.write_width)
-          urc_elems_written := urc_elems_written + 1.U
-        }
-
-        ProtoaccLogger.logInfo("Handle 32bit. fieldno: %d, value: 0x%x\n", field_no_reg, result32)
-        ProtoaccLogger.logInfo("Handle 32bit. is_repeated: %d, type: %d, waddr: 0x%x\n",
-          is_repeated, type_info, io.fixed_writer_request.bits.write_addr)
-
-        when (urc_valid && last_consumer_transaction) {
-          fieldState := sEndBufCloseurcArray
-        } .otherwise {
-          fieldState := sReadKey
-        }
-
-      }
-    }
-
-    is (sHandleLengthDelim) {
-
-      val nested_message = type_info === PROTO_TYPES.TYPE_MESSAGE
-      val string_or_bytes = ((type_info === PROTO_TYPES.TYPE_STRING) || (type_info === PROTO_TYPES.TYPE_BYTES))
-      val packed_repeated = !nested_message && !string_or_bytes
-
-
-
-
-
-      val nestedobj_encodedlen = RegInit(0.U(64.W))
-      val newobjwriteaddr = RegInit(0.U(64.W))
-      val newobj_descriptor = RegInit(0.U(64.W))
-      val newobj_vptr = RegInit(0.U(64.W))
-
-      switch (switchNestedMessageSetupState) {
-        is (sNestedMessageWait) {
-
-          when (nested_message) {
-            io.fixed_writer_request.bits.write_data := fixed_alloc_region_next
-            io.fixed_writer_request.bits.write_width := UInt(3)
-            io.consumer.output_ready := io.fixed_writer_request.ready
-            io.fixed_writer_request.valid := io.consumer.output_valid
-            io.consumer.user_consumed_bytes := varintlen
-
-          }
-
-          when (io.consumer.output_valid && io.fixed_writer_request.ready && nested_message) {
-            when (descriptor_responseReg.is_repeated) {
-              urc_next_write_addr := urc_next_write_addr + (1.U(64.W) << io.fixed_writer_request.bits.write_width)
-              urc_elems_written := urc_elems_written + 1.U
-            }
-
-            ProtoaccLogger.logInfo("NESTED MESSAGE. s1. is_repeated: %d, type: %d, ptr_waddr: 0x%x, ptr_value: 0x%x, packedfieldlen: %d bytes\n",
-              is_repeated, type_info, io.fixed_writer_request.bits.write_addr,
-              fixed_alloc_region_next, varintresult)
-
-            nestedobj_encodedlen := varintresult
-            switchNestedMessageSetupState := sGetDescrTableAddr
-
-            newobjwriteaddr := fixed_alloc_region_next
-          }
-
-        }
-
-        is (sGetDescrTableAddr) {
-          descriptor_table_handler.io.extra_meta_response.ready := Bool(true)
-          when (descriptor_table_handler.io.extra_meta_response.valid) {
-            newobj_descriptor := descriptor_table_handler.io.extra_meta_response.bits.extra_meta0
-            switchNestedMessageSetupState := sLoadVPtr
-          }
-        }
-        is (sLoadVPtr) {
-          descriptor_table_handler.io.extra_meta_response.ready := io.fixed_writer_request.ready
-          io.fixed_writer_request.valid := descriptor_table_handler.io.extra_meta_response.valid
-
-          val obtained_vptr = descriptor_table_handler.io.extra_meta_response.bits.extra_meta0
-          io.fixed_writer_request.bits.write_addr := newobjwriteaddr
-          io.fixed_writer_request.bits.write_data := obtained_vptr
-          io.fixed_writer_request.bits.write_width := UInt(3)
-
-          when (descriptor_table_handler.io.extra_meta_response.valid && io.fixed_writer_request.ready) {
-            newobj_vptr := obtained_vptr
-            switchNestedMessageSetupState := sObjLenStackManagement
-
-            val newobj_cpp_len = descriptor_table_handler.io.extra_meta_response.bits.extra_meta1
-            val newobj_cpp_len_align8 = ((newobj_cpp_len + 7.U) >> 3.U) << 3.U
-            fixed_alloc_region_next := fixed_alloc_region_next + newobj_cpp_len_align8
-
-          }
-
-        }
-        is (sObjLenStackManagement) {
-          descriptor_table_handler.io.extra_meta_response.ready := Bool(true)
-          when (descriptor_table_handler.io.extra_meta_response.valid) {
-            switchNestedMessageSetupState := sNestedMessageWait
-
-            when (urc_valid && just_completed_buffer) {
-              fieldState := sEndBufCloseurcArray
-            } .otherwise {
-              fieldState := sReadKey
-            }
-
-            val min_max_field_nos = descriptor_table_handler.io.extra_meta_response.bits.extra_meta1
-            val obtained_hasbits_offset = descriptor_table_handler.io.extra_meta_response.bits.extra_meta0
-            val min_field_no = min_max_field_nos >> 32
-            val max_field_no = min_max_field_nos(31, 0)
-            ProtoaccLogger.logInfo("MinFieldNo: %d, MaxFieldNo: %d", min_field_no, max_field_no)
-
-            val compare_encoded_lens = processed_len_total + nestedobj_encodedlen
-            when (compare_encoded_lens === current_len) {
-              ProtoaccLogger.logInfo("NStack: Replacing top entry\n")
-              out_addr_stack(stacks_index) := newobjwriteaddr
-              hasbits_offset_stack(stacks_index) := obtained_hasbits_offset
-              descr_table_stack(stacks_index) := newobj_descriptor
-              min_field_no_stack(stacks_index) := min_field_no
-            } .otherwise {
-              ProtoaccLogger.logInfo("NStack: Adding entry\n")
-              val next_stack_ind = stacks_index + 1.U
-              out_addr_stack(next_stack_ind) := newobjwriteaddr
-              hasbits_offset_stack(next_stack_ind) := obtained_hasbits_offset
-              descr_table_stack(next_stack_ind) := newobj_descriptor
-              lens_table_stack(next_stack_ind) := compare_encoded_lens
-              min_field_no_stack(next_stack_ind) := min_field_no
-              stacks_index := next_stack_ind
-            }
-          }
-        }
-      }
-
-      val repLenBytesLeft = RegInit(0.U(64.W))
-      val type_tracker = RegInit(0.U(64.W))
-      val repeatedfield_obj_addr = RegInit(0.U(64.W))
-      val current_packed_write_ptr = RegInit(0.U(64.W))
-      val elements_written = RegInit(0.U(64.W))
-
-      switch (packedRepeatedFieldState) {
-        is (sPackedRepeatedWait) {
-
-          when (packed_repeated) {
-            io.fixed_writer_request.bits.write_data := fixed_alloc_region_next
-            io.fixed_writer_request.bits.write_width := UInt(3)
-            io.consumer.output_ready := io.fixed_writer_request.ready
-            io.fixed_writer_request.valid := io.consumer.output_valid
-            io.consumer.user_consumed_bytes := varintlen
-
-          }
-
-          when (io.fixed_writer_request.ready && io.consumer.output_valid && packed_repeated) {
-            type_tracker := type_info
-            repeatedfield_obj_addr := descriptor_responseReg.write_addr
-
-            repLenBytesLeft := varintresult
-            elements_written := 0.U
-
-            packedRepeatedFieldState := sPackedRepeatedMoveData
-
-            ProtoaccLogger.logInfo("PACKED_REPEATED. s1. is_repeated: %d, type: %d, ptr_waddr: 0x%x, ptr_value: 0x%x, packedfieldlen: %d bytes\n",
-              is_repeated, type_info, io.fixed_writer_request.bits.write_addr,
-              fixed_alloc_region_next, varintresult)
-
-            current_packed_write_ptr := fixed_alloc_region_next
-          }
-
-        }
-        is (sPackedRepeatedMoveData) {
-          io.fixed_writer_request.bits.write_addr := current_packed_write_ptr
-
-          val consume_varint = type_tracker === PROTO_TYPES.TYPE_INT64 ||
-                              type_tracker === PROTO_TYPES.TYPE_UINT64 ||
-                              type_tracker === PROTO_TYPES.TYPE_INT32 ||
-                              type_tracker === PROTO_TYPES.TYPE_BOOL ||
-                              type_tracker === PROTO_TYPES.TYPE_UINT32 ||
-                              type_tracker === PROTO_TYPES.TYPE_ENUM ||
-                              type_tracker === PROTO_TYPES.TYPE_SINT32 ||
-                              type_tracker === PROTO_TYPES.TYPE_SINT64
-          val consume_8bytes = type_tracker === PROTO_TYPES.TYPE_DOUBLE ||
-                               type_tracker === PROTO_TYPES.TYPE_FIXED64
-          val consume_4bytes = type_tracker === PROTO_TYPES.TYPE_FLOAT ||
-                               type_tracker === PROTO_TYPES.TYPE_FIXED32
-
-          val consume_width = Wire(0.U(4.W))
-          when (consume_varint) {
-            io.consumer.user_consumed_bytes := varintlen
-            consume_width := varintlen
-          } .elsewhen (consume_8bytes) {
-            io.consumer.user_consumed_bytes := 8.U
-            consume_width := 8.U
-          } .elsewhen (consume_4bytes) {
-            io.consumer.user_consumed_bytes := 4.U
-            consume_width := 4.U
-          } .otherwise {
-            assert(Bool(false), "ERROR")
-          }
-
-          val write_8bytes = type_tracker === PROTO_TYPES.TYPE_DOUBLE ||
-                             type_tracker === PROTO_TYPES.TYPE_FIXED64 ||
-                             type_tracker === PROTO_TYPES.TYPE_INT64 ||
-                             type_tracker === PROTO_TYPES.TYPE_UINT64 ||
-                             type_tracker === PROTO_TYPES.TYPE_SINT64
-          val write_4bytes = type_tracker === PROTO_TYPES.TYPE_FLOAT ||
-                             type_tracker === PROTO_TYPES.TYPE_FIXED32 ||
-                             type_tracker === PROTO_TYPES.TYPE_INT32 ||
-                             type_tracker === PROTO_TYPES.TYPE_UINT32 ||
-                             type_tracker === PROTO_TYPES.TYPE_SINT32 ||
-                             type_tracker === PROTO_TYPES.TYPE_ENUM
-          val write_1bytes = type_tracker === PROTO_TYPES.TYPE_BOOL
-
-
-          val write_width = Wire(0.U(4.W))
-          when (write_8bytes) {
-            io.fixed_writer_request.bits.write_width := UInt(3)
-            write_width := 8.U
-          } .elsewhen (write_4bytes) {
-            io.fixed_writer_request.bits.write_width := UInt(2)
-            write_width := 4.U
-          } .elsewhen (write_1bytes) {
-            io.fixed_writer_request.bits.write_width := UInt(0)
-            write_width := 1.U
-          } .otherwise {
-            assert(Bool(false), "ERROR")
-          }
-
-
-          val output_signed_varint64 = type_tracker === PROTO_TYPES.TYPE_SINT64
-          val output_signed_varint32 = type_tracker === PROTO_TYPES.TYPE_SINT32
-          val output_regular_varint = type_tracker === PROTO_TYPES.TYPE_INT64 ||
-                                      type_tracker === PROTO_TYPES.TYPE_UINT32 ||
-                                      type_tracker === PROTO_TYPES.TYPE_UINT64 ||
-                                      type_tracker === PROTO_TYPES.TYPE_INT32 ||
-                                      type_tracker === PROTO_TYPES.TYPE_BOOL ||
-                                      type_tracker === PROTO_TYPES.TYPE_ENUM
-          val output_raw = type_tracker === PROTO_TYPES.TYPE_DOUBLE ||
-                           type_tracker === PROTO_TYPES.TYPE_FLOAT ||
-                           type_tracker === PROTO_TYPES.TYPE_FIXED64 ||
-                           type_tracker === PROTO_TYPES.TYPE_FIXED32
-
-          when (output_signed_varint64) {
-            io.fixed_writer_request.bits.write_data := varint_zigzag64_result
-          } .elsewhen (output_signed_varint32) {
-            io.fixed_writer_request.bits.write_data := varint_zigzag32_result
-          } .elsewhen (output_regular_varint) {
-            io.fixed_writer_request.bits.write_data := varintresult
-          } .elsewhen (output_raw) {
-            io.fixed_writer_request.bits.write_data := io.consumer.output_data(63, 0)
-          } .otherwise {
-            assert(Bool(false), "ERROR")
-          }
-
-          io.fixed_writer_request.valid := io.consumer.output_valid
-          io.consumer.output_ready := io.fixed_writer_request.ready
-          when (io.fixed_writer_request.ready && io.consumer.output_valid) {
-            ProtoaccLogger.logInfo("PACKED_REPEATED. s2. write_width %d, consumed_bytes %d\n", write_width, consume_width)
-
-            repLenBytesLeft := repLenBytesLeft - consume_width
-            current_packed_write_ptr := current_packed_write_ptr + write_width
-            elements_written := elements_written + 1.U
-
-            when (repLenBytesLeft === consume_width) {
-              ProtoaccLogger.logInfo("PACKED_REPEATED. s3. write_width %d, consumed_bytes %d\n", write_width, consume_width)
-              repeatedfield_obj_addr := repeatedfield_obj_addr - 8.U
-              fixed_alloc_region_next := ((current_packed_write_ptr + write_width + 7.U) >> 3.U) << 3.U
-              packedRepeatedFieldState := sPackedRepeatedWriteHeader
-            }
-          }
-        }
-        is (sPackedRepeatedWriteHeader) {
-          io.fixed_writer_request.valid := Bool(true)
-          io.fixed_writer_request.bits.write_width := UInt(3)
-
-          io.fixed_writer_request.bits.write_data := ((elements_written << 32) | elements_written(31, 0))(63, 0)
-          io.fixed_writer_request.bits.write_addr := repeatedfield_obj_addr
-
-          when(io.fixed_writer_request.ready) {
-              ProtoaccLogger.logInfo("PACKED_REPEATED. s4. sizes 0x%x, addr 0x%x\n",
-              io.fixed_writer_request.bits.write_data, io.fixed_writer_request.bits.write_addr)
-            packedRepeatedFieldState := sPackedRepeatedWait
-
-            when (urc_valid && just_completed_buffer) {
-              fieldState := sEndBufCloseurcArray
-            } .otherwise {
-              fieldState := sReadKey
-            }
-
-
-          }
-        }
-      }
-
-
-
-      val stringLenNoNull = RegInit(0.U(64.W))
-      val stringLenWithNull = RegInit(0.U(64.W))
-      val stringLenWithNullPadded = RegInit(0.U(64.W))
-      val data_write_ptr = RegInit(0.U(64.W))
-
-      val obj_header_write_ptr = RegInit(0.U(64.W))
-      val handling_bytes = RegInit(Bool(false))
-
-      switch (stringFieldState) {
-        is (sStringWait) {
-
-
-          val fixed_alloc_region_next_16B_aligned = (fixed_alloc_region_next + UInt(15)) & ~(UInt(15, 64.W))
-
-
-          when (string_or_bytes) {
-            io.fixed_writer_request.bits.write_data := fixed_alloc_region_next_16B_aligned
-            io.fixed_writer_request.bits.write_width := UInt(3)
-            io.consumer.output_ready := io.fixed_writer_request.ready
-            io.fixed_writer_request.valid := io.consumer.output_valid
-            io.consumer.user_consumed_bytes := varintlen
-          }
-
-          when (io.fixed_writer_request.ready && io.consumer.output_valid && string_or_bytes) {
-
-            when (descriptor_responseReg.is_repeated) {
-              urc_next_write_addr := urc_next_write_addr + (8.U)
-              urc_elems_written := urc_elems_written + 1.U
-            }
-
-            obj_header_write_ptr := fixed_alloc_region_next_16B_aligned
-            fixed_alloc_region_next := fixed_alloc_region_next_16B_aligned + (32.U)
-
-            handling_bytes := type_info === PROTO_TYPES.TYPE_BYTES
-
-            stringLenNoNull := varintresult
-            stringLenWithNull := varintresult + UInt(1)
-
-            stringFieldState := sStringWriteHeader0
-
-            ProtoaccLogger.logInfo("Handle String. is_repeated: %d, type: %d, ptr_waddr: 0x%x, ptr_value: 0x%x, stringlen: %d bytes\n",
-              is_repeated, type_info, io.fixed_writer_request.bits.write_addr,
-              fixed_alloc_region_next, varintresult)
-
-
-          }
-        }
-        is (sStringWriteHeader0) {
-          val header0_val = Mux(stringLenWithNull <= 16.U(64.W),
-            obj_header_write_ptr + 16.U(64.W),
-            fixed_alloc_region_next)
-          data_write_ptr := header0_val
-
-          io.fixed_writer_request.valid := Bool(true)
-
-          io.fixed_writer_request.bits.write_width := UInt(3)
-          io.fixed_writer_request.bits.write_data := header0_val
-          io.fixed_writer_request.bits.write_addr := obj_header_write_ptr
-
-          when(io.fixed_writer_request.ready) {
-            stringFieldState := sStringWriteHeader1
-            obj_header_write_ptr := obj_header_write_ptr + 8.U
-
-            val stringLenWithNullPadded_calc = (stringLenWithNull + UInt(15)) & ~(UInt(15, 64.W))
-            stringLenWithNullPadded := stringLenWithNullPadded_calc
-
-            val fixed_alloc_region_increment = Mux(stringLenWithNull <= 16.U(64.W),
-                UInt(0),
-                stringLenWithNullPadded_calc
-              )
-
-            fixed_alloc_region_next := fixed_alloc_region_next + fixed_alloc_region_increment
-            ProtoaccLogger.logInfo("Current alloc base: 0x%x, Next alloc base: 0x%x\n", fixed_alloc_region_next, fixed_alloc_region_next + fixed_alloc_region_increment)
-          }
-        }
-        is (sStringWriteHeader1) {
-          io.fixed_writer_request.valid := Bool(true)
-
-          io.fixed_writer_request.bits.write_width := UInt(3)
-          io.fixed_writer_request.bits.write_data := stringLenNoNull
-          io.fixed_writer_request.bits.write_addr := obj_header_write_ptr
-
-          when(io.fixed_writer_request.ready) {
-            stringFieldState := sStringMoveData
-          }
-        }
-        is (sStringMoveData) {
-          ProtoaccLogger.logInfo("sStringMoveData State\n")
-          val inc_amt_log2 = UInt(4)
-          io.fixed_writer_request.bits.write_width := inc_amt_log2
-          io.fixed_writer_request.bits.write_addr := data_write_ptr
-
-
-          when (io.fixed_writer_request.ready && !io.consumer.output_valid) {
-            ProtoaccLogger.logInfo("fixed_writer ready but not consumer output\n")
-          } .elsewhen (!io.fixed_writer_request.ready && io.consumer.output_valid) {
-            ProtoaccLogger.logInfo("consumer output valid but not fixed_writer ready\n")
-          }
-
-
-
-          when (stringLenWithNullPadded > 16.U(64.W)) {
-            val inc_amt = UInt(16)
-            io.consumer.user_consumed_bytes := inc_amt
-
-            val result128 = io.consumer.output_data(127, 0)
-            io.fixed_writer_request.bits.write_data := result128
-
-            io.fixed_writer_request.valid := io.consumer.output_valid
-            io.consumer.output_ready := io.fixed_writer_request.ready
-            when (io.fixed_writer_request.ready && io.consumer.output_valid) {
-              ProtoaccLogger.logInfo("---stringLenWithNullPadded: %d\n", stringLenWithNullPadded)
-              ProtoaccLogger.logInfo("---stringLenWithNull: %d\n", stringLenWithNull)
-              ProtoaccLogger.logInfo("---stringLenNoNull: %d\n", stringLenNoNull)
-
-              data_write_ptr := data_write_ptr + inc_amt
-              stringLenWithNullPadded := stringLenWithNullPadded - inc_amt
-              stringLenWithNull := stringLenWithNull - inc_amt
-              stringLenNoNull := stringLenNoNull - inc_amt
-            }
-          } .elsewhen (stringLenWithNullPadded === 16.U(64.W) && stringLenNoNull =/= 0.U(64.W)) {
-            val inc_amt = UInt(16)
-            io.consumer.user_consumed_bytes := stringLenNoNull
-
-            val result128 = io.consumer.output_data(127, 0)
-            val stringLenNoNullShamt = stringLenNoNull(3, 0) << 3
-            io.fixed_writer_request.bits.write_data := result128 & ((1.U(128.W) << (stringLenNoNullShamt)) - UInt(1))
-
-            io.fixed_writer_request.valid := io.consumer.output_valid
-            io.consumer.output_ready := io.fixed_writer_request.ready
-            when (io.fixed_writer_request.ready && io.consumer.output_valid) {
-              ProtoaccLogger.logInfo("---stringLenWithNullPadded: %d\n", stringLenWithNullPadded)
-              ProtoaccLogger.logInfo("---stringLenWithNull: %d\n", stringLenWithNull)
-              ProtoaccLogger.logInfo("---stringLenNoNull: %d\n", stringLenNoNull)
-
-              data_write_ptr := data_write_ptr + inc_amt
-              stringLenWithNullPadded := stringLenWithNullPadded - inc_amt
-              stringLenWithNull := stringLenWithNull - inc_amt
-              stringLenNoNull := stringLenNoNull - inc_amt
-
-              ProtoaccLogger.logInfo("---DONE STRING!\n")
-
-              when (urc_valid && last_consumer_transaction) {
-                fieldState := sEndBufCloseurcArray
-              } .otherwise {
-                fieldState := sReadKey
-              }
-
-              stringFieldState := sStringWait
-            }
-          } .elsewhen (stringLenWithNullPadded === 16.U(64.W) && stringLenNoNull === 0.U(64.W)) {
-            when (io.fixed_writer_request.ready) {
-              ProtoaccLogger.logInfo("---DONE STRING!\n")
-
-              when (urc_valid && just_completed_buffer) {
-                fieldState := sEndBufCloseurcArray
-              } .otherwise {
-                fieldState := sReadKey
-              }
-
-              stringFieldState := sStringWait
-            }
-            io.fixed_writer_request.bits.write_data := UInt(0)
-            io.fixed_writer_request.valid := Bool(true)
-            io.consumer.output_ready := Bool(false)
-            io.consumer.user_consumed_bytes := UInt(0)
-          } .otherwise {
-            assert(Bool(false), "should be unreachable\n")
-          }
-
-        }
-      }
-
-    }
-    is (sHandleStartGroup) {
-      assert(fieldState =/= sHandleStartGroup, "Start Group not yet implemented")
-    }
-    is (sHandleEndGroup) {
-      assert(fieldState =/= sHandleEndGroup, "End Group not yet implemented")
-    }
-    is (sEndBufCloseurcArray) {
-
-      when (urc_is_repeated_ptr_field) {
-        when (urc_teardown_stage === 0.U) {
-          io.fixed_writer_request.bits.write_data := ((urc_elems_written << 32) | urc_elems_written(31, 0))(63, 0)
-          io.fixed_writer_request.valid := Bool(true)
-          io.fixed_writer_request.bits.write_addr := urc_ptr_to_inobjsizes
-          io.fixed_writer_request.bits.write_width := 3.U
-
-          when (io.fixed_writer_request.ready) {
-            ProtoaccLogger.logInfo("[unpacked repptrfield] closeout end of buf s0\n")
-            urc_teardown_stage := 1.U
-          }
-        } .otherwise {
-          io.fixed_writer_request.bits.write_data := urc_elems_written
-          io.fixed_writer_request.valid := Bool(true)
-          io.fixed_writer_request.bits.write_addr := urc_ptr_to_repobjsizes
-          io.fixed_writer_request.bits.write_width := 3.U
-
-          when (io.fixed_writer_request.ready) {
-            ProtoaccLogger.logInfo("[unpacked repptrfield] closeout end of buf s1\n")
-            urc_valid := Bool(false)
-            array_alloc_region_next := ((urc_next_write_addr + 7.U) >> 3.U) << 3.U
-            urc_teardown_stage := 0.U
-            fieldState := sReadKey
-
-          }
-        }
+     // this points to curr_size_ and total_size_ (want to read curr_size_)
+      when (is_bytes_or_string) {
+        io.memread.req.bits.addr := src_data_addr_reg
       } .otherwise {
-        io.fixed_writer_request.bits.write_data := ((urc_elems_written << 32) | urc_elems_written(31, 0))(63, 0)
-        io.fixed_writer_request.valid := Bool(true)
-        io.fixed_writer_request.bits.write_addr := urc_ptr_to_inobjsizes
-        io.fixed_writer_request.bits.write_width := 3.U
+        io.memread.req.bits.addr := src_data_addr_reg - 8.U
+      }
+      io.memread.req.bits.size := 3.U
 
-        when (io.fixed_writer_request.ready) {
-          ProtoaccLogger.logInfo("[unpacked repfield] closeout end of buf\n")
+      when (io.memread.req.ready) {
+        ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_GETSIZE: req size of unpacked from: addr 0x%x, read size 0x%x\n",
+          io.memread.req.bits.addr,
+          io.memread.req.bits.size)
+        handlerState := S_UNPACKED_REP_RECVPTR
+      }
+    }
 
-          urc_valid := Bool(false)
-          array_alloc_region_next := ((urc_next_write_addr + 7.U) >> 3.U) << 3.U
-          fieldState := sReadKey
+    is (S_UNPACKED_REP_RECVPTR) {
+      ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_RECVPTR: recv ptr to unpacked\n")
 
+      io.memread.resp.ready := true.B
+      when (io.memread.resp.valid) {
+        ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_RECVPTR: recv ptr to unpacked. got addr 0x%x\n",
+          io.memread.resp.bits.data)
+        when (is_bytes_or_string) {
+          // given the response (if's a string/bytes), if (data & 1) == 0 then its a ptr directly to 1 inner type, otherwise its a ptr to the Rep object (same as before)
+          when ((io.memread.resp.bits.data & 1.U) === 0.U) {
+            repeated_elems_headptr := src_data_addr_reg - 8.U // shouldn't have changed yet
+          } .otherwise {
+            repeated_elems_headptr := (io.memread.resp.bits.data & ~(1.U(io.memread.resp.bits.data.getWidth.W))) + 8.U // this recv (non added) points to allocated_size in Rep struct (in struct this is 8b aligned), so skip to the actual ptr
+          }
+          //ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_RECVPTR: ADJUSTED PTR FOR REPPTR FIELD. got addr 0x%x\n",
+          //  io.memread.resp.bits.data + 8.U)
+          ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_RECVPTR: ADJUSTED PTR FOR REPPTR FIELD\n")
+        } .otherwise {
+          repeated_elems_headptr := io.memread.resp.bits.data
+        }
+        handlerState := S_UNPACKED_REP_RECVSIZE
+      }
+    }
+    is (S_UNPACKED_REP_RECVSIZE) {
+
+      ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_RECVSIZE: recv size of unpacked\n")
+
+      io.memread.resp.ready := true.B
+      when (io.memread.resp.valid) {
+        val num_elems = io.memread.resp.bits.data(31, 0)
+        val ptr_to_last_elem = repeated_elems_headptr + ((num_elems - 1.U) << cpp_size_log2_reg)
+
+        ProtoaccLogger.logInfo(logPrefix + " S_UNPACKED_REP_RECVSIZE: recv size of unpacked. got size (elems) %d, ptr to last elem is 0x%x\n",
+          num_elems,
+          ptr_to_last_elem)
+
+        src_data_addr_reg := ptr_to_last_elem
+        when (is_bytes_or_string) {
+          handlerState := S_STRING_GETPTR
+        } .otherwise {
+          handlerState := S_SCALAR_DISPATCH_REQ
         }
       }
-
     }
 
   }
 
 }
-
-

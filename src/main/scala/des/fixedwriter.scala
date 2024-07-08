@@ -1,4 +1,4 @@
-package protoacc
+package protoacc.des
 
 import Chisel._
 import chisel3.{Printable}
@@ -9,6 +9,7 @@ import freechips.rocketchip.rocket.{TLBConfig}
 import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 
+import protoacc._
 class FixedWriterRequest extends Bundle {
   val write_width = UInt(3.W)
   val write_data = UInt(128.W)
@@ -42,4 +43,3 @@ class FixedWriter()(implicit p: Parameters) extends Module
 
   io.l1helperUser.resp.ready := Bool(true)
 }
-

@@ -9,11 +9,8 @@ import freechips.rocketchip.rocket.{TLBConfig}
 import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 
-
-
 object ProtoaccLogger {
-
-  def logInfo(format: String, args: Bits*)(implicit p: Parameters) {
+  def logInfo(format: String, args: Bits*)(implicit p: Parameters): Unit = {
     val loginfo_cycles = RegInit(0.U(64.W))
     loginfo_cycles := loginfo_cycles + 1.U
 
@@ -26,14 +23,12 @@ object ProtoaccLogger {
     }
   }
 
-  def logWaveStyle(format: String, args: Bits*)(implicit p: Parameters) {
+  def logWaveStyle(format: String, args: Bits*)(implicit p: Parameters): Unit = {
 
   }
-
 }
 
 object ProtoaccParams {
   val MAX_NESTED_LEVELS = 25
   val MAX_NESTED_LEVELS_WIDTH = log2Up(MAX_NESTED_LEVELS) + 1
-
 }

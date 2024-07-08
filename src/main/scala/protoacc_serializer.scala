@@ -10,6 +10,8 @@ import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 import freechips.rocketchip.tilelink._
 
+import protoacc.ser._
+
 class ProtoAccelSerializer(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(
     opcodes = opcodes, nPTWPorts = 9) {
   override lazy val module = new ProtoAccelSerializerImp(this)

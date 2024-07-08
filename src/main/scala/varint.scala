@@ -132,5 +132,3 @@ class CombinationalVarint()(implicit p: Parameters) extends Module {
   )
 
 }
-
-

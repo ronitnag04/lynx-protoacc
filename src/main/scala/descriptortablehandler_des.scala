@@ -9,7 +9,6 @@ import freechips.rocketchip.rocket.{TLBConfig}
 import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 
-
 object WIRE_TYPES {
   val WIRE_TYPE_VARINT = 0.U
   val WIRE_TYPE_64bit = 1.U
@@ -366,5 +365,3 @@ class DescriptorTableHandler()(implicit p: Parameters) extends Module
     }
   }
 }
-
-

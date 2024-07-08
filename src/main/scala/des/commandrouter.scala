@@ -1,4 +1,4 @@
-package protoacc
+package protoacc.des
 
 import Chisel._
 import chisel3.{Printable}
@@ -8,6 +8,8 @@ import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.rocket.{TLBConfig}
 import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
+
+import protoacc._
 
 class CommandRouter()(implicit p: Parameters) extends Module {
 
@@ -123,4 +125,3 @@ class CommandRouter()(implicit p: Parameters) extends Module {
 
 
 }
-
