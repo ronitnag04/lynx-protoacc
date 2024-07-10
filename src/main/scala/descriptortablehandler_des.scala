@@ -197,20 +197,6 @@ class DescriptorResponse extends Bundle {
   val write_addr = UInt(OUTPUT, 64.W)
 }
 
-class DescriptorResponseExtra extends Bundle {
-  val unpacked_repeated = Bool()
-  val is_repeated_ptr_field = Bool()
-
-  val ptr_to_repeated_field = UInt(64.W)
-
-  val ptr_to_repeated_field_sizes = UInt(64.W)
-  val ptr_to_repeated_field_elems = UInt(64.W)
-
-  val ptr_to_repeated_ptr_field_sizes = UInt(64.W)
-  val ptr_to_repeated_ptr_field_rep = UInt(64.W)
-
-}
-
 class DescriptorTableHandler()(implicit p: Parameters) extends Module
   with MemoryOpConstants {
   val io = IO(new Bundle {

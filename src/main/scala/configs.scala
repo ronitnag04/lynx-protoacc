@@ -12,8 +12,6 @@ import freechips.rocketchip.tilelink._
 import protoacc.des._
 import protoacc.ser._
 
-case object ProtoAccelPrintfEnable extends Field[Boolean](false)
-
 class WithProtoAccel extends Config ((site, here, up) => {
   case ProtoTLB => Some(TLBConfig(nSets = 4, nWays = 4, nSectors = 1, nSuperpageEntries = 1))
   case BuildRoCC => up(BuildRoCC) ++ Seq(
