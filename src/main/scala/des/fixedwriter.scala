@@ -42,4 +42,12 @@ class FixedWriter()(implicit p: Parameters) extends Module
   io.fixed_writer_request.ready := l1reqQueue.io.enq.ready
 
   io.l1helperUser.resp.ready := Bool(true)
+
+  when (io.fixed_writer_request.fire()) {
+    ProtoaccLogger.logInfo("ReqSent: Addr:0x%x Width:0x%x Data:0x%x\n",
+      io.fixed_writer_request.bits.write_addr,
+      io.fixed_writer_request.bits.write_width,
+      io.fixed_writer_request.bits.write_data
+    )
+  }
 }
