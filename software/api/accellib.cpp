@@ -12,7 +12,12 @@
 #error Need ACCEL_REGION_SER_SHIFT
 #endif
 
+// disable prints
+#define printf(...) (0)
+
 void AccelSetupFixedAllocRegion() {
+    asm volatile ("addi x0, x1, 0");
+
     ROCC_INSTRUCTION(PROTOACC_OPCODE, FUNCT_SFENCE);
 
     size_t regionsize = sizeof(char) * (128 << ACCEL_REGION_DEFAULT_SHIFT);
@@ -33,9 +38,8 @@ void AccelSetupFixedAllocRegion() {
     assert((fixed_ptr_as_int & 0x7) == 0x0);
     assert((array_ptr_as_int & 0x7) == 0x0);
 
-    //printf("accelerator given %lld byte region, starting at 0x%016llx for fixed alloc\n", (uint64_t)regionsize, fixed_ptr_as_int);
-    //printf("accelerator given %lld byte region, starting at 0x%016llx for array alloc\n", (uint64_t)regionsize, array_ptr_as_int);
-
+    printf("accelerator given %lld byte region, starting at 0x%016llx for fixed alloc\n", (uint64_t)regionsize, fixed_ptr_as_int);
+    printf("accelerator given %lld byte region, starting at 0x%016llx for array alloc\n", (uint64_t)regionsize, array_ptr_as_int);
 }
 
 void AccelSetup() {
@@ -73,8 +77,8 @@ volatile char ** AccelSetupFixedAllocRegionSerializer() {
     assert((stringalloc_region_ptr_as_int_tail & 0x7) == 0x0);
     assert((string_ptr_region_ptr_as_int & 0x7) == 0x0);
 
-    //printf("accelerator given %lld byte region, tail at 0x%016llx for string alloc\n", (uint64_t)regionsize, stringalloc_region_ptr_as_int_tail);
-    //printf("accelerator given %lld byte region, starting at 0x%016llx for string ptr alloc\n", (uint64_t)string_ptr_region_size, string_ptr_region_ptr_as_int);
+    printf("accelerator given %lld byte region, tail at 0x%016llx for string alloc\n", (uint64_t)regionsize, stringalloc_region_ptr_as_int_tail);
+    printf("accelerator given %lld byte region, starting at 0x%016llx for string ptr alloc\n", (uint64_t)string_ptr_region_size, string_ptr_region_ptr_as_int);
 
     return (volatile char**)stringptr_region;
 }

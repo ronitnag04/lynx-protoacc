@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
 class PrimitiveInfo:
-    def __init__(self, testname, primname, cpptype, testvals, is_repeated=False, nestedtype=None):
+    def __init__(self, testname, primname, cpptype, testvals, is_repeated=False, nestedtype=None, num_repeated=1):
         self.testname = testname
         self.primname = primname
         self.cpptype = cpptype
         self.testvals = testvals
         self.is_repeated = is_repeated
+        self.num_repeated = num_repeated # num of types the value is repeated
         self.nestedtype = nestedtype
         if self.nestedtype is not None and self.is_repeated:
             exit(1)
@@ -55,7 +56,10 @@ class PrimitiveInfo:
 
     def get_setter_line(self, fieldindex):
         if self.is_repeated:
-            msg = """fillmessage->add_pacc{FIELDTYPE}_{FIELDINDEX}(testvals[{FIELDINDEX}]);""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex)
+            msg = ""
+            for i in range(self.num_repeated):
+                msg = msg + """fillmessage->add_pacc{FIELDTYPE}_{FIELDINDEX}(testvals[{FIELDINDEX}]);""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex)
+                msg = msg + "\n"
         elif self.nestedtype is not None:
             msg = """nested_message->set_pacc{NESTEDFIELDTYPE}_{FIELDINDEX}(testvals[{FIELDINDEX}]);
             fillmessage->set_allocated_pacc{FIELDTYPE}_{FIELDINDEX}(nested_message);
@@ -155,6 +159,8 @@ primitive_info_objs = [
 
     PrimitiveInfo("bytes", "bytes", "string", ['"hello"']),
     PrimitiveInfo("bytes_repeated", "bytes", "string", ['"hello"'], is_repeated=True),
+    PrimitiveInfo("bytes_repeated_2", "bytes", "string", ['"hello"'], is_repeated=True, num_repeated=2),
+    PrimitiveInfo("bytes_repeated_0", "bytes", "string", ['"hello"'], is_repeated=True, num_repeated=0),
 
     PrimitiveInfo("bytes_long", "bytes", "string", ['"hello hello hello hello hello hello hello"']),
     PrimitiveInfo("bytes_very_long", "bytes", "string", ['"' + ("a" * 489) + '"']),
@@ -236,6 +242,8 @@ def cpp_test_contents(fieldtypeobj):
         string hostplat = "x86";
         #endif
 
+        #define ITERS 1
+        #define RUN_CPU
 
         std::cout << "s2\\n" << std::flush;
 
@@ -243,8 +251,6 @@ def cpp_test_contents(fieldtypeobj):
 
 
         std::cout << "s3\\n" << std::flush;
-
-            std::cout << "s4\\n" << std::flush;
 
             google::protobuf::Arena arena;
             {ALLOCFIELDMESSAGE}
@@ -254,7 +260,6 @@ def cpp_test_contents(fieldtypeobj):
             string outstr;
             fillmessage->SerializeToString(&outstr);
 
-            #define ITERS 1000
             bool failcheck = false;
 
             std::cout << "encodedlen " << outstr.length() << "\\n" << std::flush;
@@ -272,7 +277,7 @@ def cpp_test_contents(fieldtypeobj):
             }}
 
     #ifdef __riscv
-            std::cout << "s5\\n" << std::flush;
+            std::cout << "s4\\n" << std::flush;
 
             auto t1 = std::chrono::steady_clock::now();
 
@@ -309,8 +314,9 @@ def cpp_test_contents(fieldtypeobj):
                 }}
             }}
     #endif
-            std::cout << "s6\\n" << std::flush;
+            std::cout << "s5\\n" << std::flush;
 
+            #ifdef RUN_CPU
             primitivetests::{MESSAGENAME}* parseintoscpu[ITERS];
 
             for (int q = 0; q < ITERS; q++) {{
@@ -321,8 +327,10 @@ def cpp_test_contents(fieldtypeobj):
             for (int i = 0; i < ITERS; i++) {{
                 parseintoscpu[i]->ParseFromString(newstr[i]);
             }}
+            #endif
 
             auto t4 = std::chrono::steady_clock::now();
+            #ifdef RUN_CPU
             auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
 
             std::cout << (duration2 / (ITERS * 1.0)) << ", us per iter, " << hostplat << ", {TESTNAME}, " << testvals[0] << "\\n" << std::flush;
@@ -338,9 +346,9 @@ def cpp_test_contents(fieldtypeobj):
             }} else {{
                 printf("PASSED {FIELDTYPE} test.\\n");
             }}
+            #endif
 
-
-        std::cout << "s7\\n" << std::flush;
+        std::cout << "s6\\n" << std::flush;
 
         google::protobuf::ShutdownProtobufLibrary();
         return 0;

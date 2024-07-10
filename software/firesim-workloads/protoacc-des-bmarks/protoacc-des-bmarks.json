@@ -3,6 +3,7 @@
   "base" : "br-base.json",
   "workdir" : ".",
   "overlay" : "overlay",
+  "rootfs-size" : "1G",
   "jobs" : [
     {
       "name" : "bench0-des",

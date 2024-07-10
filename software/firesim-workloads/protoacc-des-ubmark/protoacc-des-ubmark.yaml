@@ -1,0 +1,9 @@
+{
+  "name" : "protoacc-des-ubmark",
+  "base" : "br-base.json",
+  "workdir" : ".",
+  "overlay" : "overlay",
+  "rootfs-size" : "1G",
+  "linux-config" : "kfrag",
+  "run" : "overlay/root/ubmarks/top-run.sh"
+}

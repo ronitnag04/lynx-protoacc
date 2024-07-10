@@ -123,6 +123,7 @@ primitive_info_objs = [
     PrimitiveInfo("bytes", "bytes", "string", ['"hello"']),
     PrimitiveInfo("bytes_repeated", "bytes", "string", ['"hello"'], is_repeated=True),
     PrimitiveInfo("bytes_repeated_2", "bytes", "string", ['"hello"'], is_repeated=True, num_repeated=2),
+    PrimitiveInfo("bytes_repeated_0", "bytes", "string", ['"hello"'], is_repeated=True, num_repeated=0),
 
     PrimitiveInfo("bytes_long", "bytes", "string", ['"hello hello hello hello hello hello hello"']),
     PrimitiveInfo("bytes_very_long", "bytes", "string", ['"' + ("a" * 489) + '"']),
@@ -222,8 +223,6 @@ def cpp_test_contents(fieldtypeobj):
 
         std::cout << "s3\\n" << std::flush;
 
-            std::cout << "s4\\n" << std::flush;
-
             google::protobuf::Arena arena;
 
             {ALLOCFIELDMESSAGE}
@@ -260,7 +259,7 @@ def cpp_test_contents(fieldtypeobj):
 
 
 #ifdef __riscv
-            std::cout << "s5\\n" << std::flush;
+            std::cout << "s4\\n" << std::flush;
 
             auto t1 = std::chrono::steady_clock::now();
             for (int iterser = 0; iterser < SERITERS; iterser++) {{
@@ -302,7 +301,7 @@ def cpp_test_contents(fieldtypeobj):
 
 #endif
 
-            std::cout << "s6\\n" << std::flush;
+            std::cout << "s5\\n" << std::flush;
 
 
              #ifdef RUN_CPU
@@ -344,7 +343,7 @@ def cpp_test_contents(fieldtypeobj):
                 }}
             }}
 
-        std::cout << "s7\\n" << std::flush;
+        std::cout << "s6\\n" << std::flush;
 
          #endif
 
