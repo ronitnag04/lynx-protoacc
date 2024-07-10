@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 
 class PrimitiveInfo:
-    def __init__(self, testname, primname, cpptype, testvals, is_repeated=False, nestedtype=None, num_repeated=1):
+    def __init__(self, testname, primname, cpptype, testvals, is_repeated=False, nestedtype=None):
         self.testname = testname
         self.primname = primname
         self.cpptype = cpptype
         self.testvals = testvals
         self.is_repeated = is_repeated
-        self.num_repeated = num_repeated # num of types the value is repeated
         self.nestedtype = nestedtype
         if self.nestedtype is not None and self.is_repeated:
             exit(1)
@@ -16,12 +15,14 @@ class PrimitiveInfo:
         return self.testname
 
     def generate_testvals_initialized(self):
-        numtests = len(self.testvals)
+        numtests = max(len(self.testvals), 1)
+        numtestsnonmin = len(self.testvals)
         comma_separated_testvals = ", ".join(self.testvals)
 
         msg = """#define NUMTESTVALS {NUMTESTS}
+#define NUMTESTVALS_NON_MIN {NUMTESTS_NON_MIN}
 {CPPTYPE} testvals[NUMTESTVALS] = {{  {INPUTVALS} }};
-""".format(NUMTESTS=numtests, CPPTYPE=self.cpptype, INPUTVALS=comma_separated_testvals)
+""".format(NUMTESTS=numtests, NUMTESTS_NON_MIN=numtestsnonmin, CPPTYPE=self.cpptype, INPUTVALS=comma_separated_testvals)
         return msg
 
     def get_fieldname_single_ident(self):
@@ -51,15 +52,15 @@ class PrimitiveInfo:
         numsets = len(self.testvals)
         retmsg = """"""
         for s in range(numsets):
-            retmsg += "            " + self.get_setter_line(s) + "\n"
+            if self.is_repeated:
+                retmsg += "            " + self.get_setter_line(0, s) + "\n"
+            else:
+                retmsg += "            " + self.get_setter_line(s, s) + "\n"
         return retmsg
 
-    def get_setter_line(self, fieldindex):
+    def get_setter_line(self, fieldindex, testidx):
         if self.is_repeated:
-            msg = ""
-            for i in range(self.num_repeated):
-                msg = msg + """fillmessage->add_pacc{FIELDTYPE}_{FIELDINDEX}(testvals[{FIELDINDEX}]);""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex)
-                msg = msg + "\n"
+            msg = """fillmessage->add_pacc{FIELDTYPE}_{FIELDINDEX}(testvals[{TESTINDEX}]);""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex, TESTINDEX=testidx)
         elif self.nestedtype is not None:
             msg = """nested_message->set_pacc{NESTEDFIELDTYPE}_{FIELDINDEX}(testvals[{FIELDINDEX}]);
             fillmessage->set_allocated_pacc{FIELDTYPE}_{FIELDINDEX}(nested_message);
@@ -72,9 +73,12 @@ class PrimitiveInfo:
 
         return msg
 
-    def get_getter(self, fieldindex):
+    def get_getter(self, fieldindex, elemidx, wo_elemidx=False):
         if self.is_repeated:
-            msg = """pacc{FIELDTYPE}_{FIELDINDEX}(0)""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex)
+            if wo_elemidx:
+                msg = """pacc{FIELDTYPE}_{FIELDINDEX}""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex)
+            else:
+                msg = """pacc{FIELDTYPE}_{FIELDINDEX}({ELEMIDX})""".format(FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=fieldindex, ELEMIDX=elemidx)
         elif self.nestedtype is not None:
             msg = """pacc{NESTEDFIELDTYPE}_{FIELDINDEX}().pacc{FIELDTYPE}_{FIELDINDEX}()""".format(NESTEDFIELDTYPE=self.get_fieldname_single_ident().lower(),
                                                                          FIELDTYPE=self.get_nested_fieldname_single_ident(), FIELDINDEX=fieldindex)
@@ -93,26 +97,46 @@ class PrimitiveInfo:
 
         return msg
 
-
+    def get_check(self, lm, rm, failmsg):
+        if self.is_repeated:
+            msg = """
+                for (auto i = 0; i < NUMTESTVALS_NON_MIN; i++) {{
+                    if ({lm}->{GETTER_NON_IDX}(i) != {rm}->{GETTER_NON_IDX}(i)) {{
+                        {MSG}
+                        exit(1);
+                    }}
+                }}
+            """.format(lm=lm, rm=rm, MSG=failmsg, GETTER_NON_IDX=self.get_getter(0, 0, True))
+        else:
+            msg = """
+                if ({lm}->{GETTER} != {rm}->{GETTER}) {{
+                    {MSG}
+                    exit(1);
+                }}
+            """.format(lm=lm, rm=rm, MSG=failmsg, GETTER=self.get_getter(0, 0))
+        return msg
 
     def get_fencecheck(self):
         if not self.is_repeated:
             msg = """"""
             for x in range(len(self.testvals)):
-                msg += """|| (parseintos[ITERS-1]->{GETTER} != fillmessage->{GETTER})  """.format(GETTER=self.get_getter(x))
+                msg += """|| (parseintos[ITERS-1]->{GETTER} != fillmessage->{GETTER})  """.format(GETTER=self.get_getter(x, x))
             return msg[2:]
         else:
             msg = """"""
             for x in range(len(self.testvals)):
-                msg += """|| (parseintos[ITERS-1]->pacc{FIELDTYPE}_{FIELDINDEX}_size() == 0 && (parseintos[ITERS-1]->{GETTER} != fillmessage->{GETTER})) """.format(GETTER=self.get_getter(x), FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=x)
-            return msg[2:]
+                msg += """|| (parseintos[ITERS-1]->pacc{FIELDTYPE}_{FIELDINDEX}_size() == 0 && (parseintos[ITERS-1]->{GETTER} != fillmessage->{GETTER})) """.format(GETTER=self.get_getter(0, x), FIELDTYPE=self.get_fieldname_single_ident(), FIELDINDEX=0)
+            if len(self.testvals) == 0:
+                return "0";
+            else:
+                return msg[2:]
         return msg
 
     def gen_simple_message(self):
         msg = """
 message {MESSAGENAME} {{
 """.format(FIELDTYPE=self.get_fieldname_single_ident(), MESSAGENAME=self.get_message_name())
-        for x in range(len(self.testvals)):
+        for x in range(max(len(self.testvals), 1)):
             msg += """  {PROPERFIELDTYPE} pacc{FIELDTYPE}_{FIELDINDEX} = {FIELDNO};
 """.format(PROPERFIELDTYPE=self.get_fieldtype_spaces(), FIELDTYPE=self.get_fieldname_single_ident(),
            FIELDINDEX=x, FIELDNO=x+1)
@@ -159,8 +183,8 @@ primitive_info_objs = [
 
     PrimitiveInfo("bytes", "bytes", "string", ['"hello"']),
     PrimitiveInfo("bytes_repeated", "bytes", "string", ['"hello"'], is_repeated=True),
-    PrimitiveInfo("bytes_repeated_2", "bytes", "string", ['"hello"'], is_repeated=True, num_repeated=2),
-    PrimitiveInfo("bytes_repeated_0", "bytes", "string", ['"hello"'], is_repeated=True, num_repeated=0),
+    PrimitiveInfo("bytes_repeated_2", "bytes", "string", ['"hello"', '"world"'], is_repeated=True),
+    PrimitiveInfo("bytes_repeated_0", "bytes", "string", [], is_repeated=True),
 
     PrimitiveInfo("bytes_long", "bytes", "string", ['"hello hello hello hello hello hello hello"']),
     PrimitiveInfo("bytes_very_long", "bytes", "string", ['"' + ("a" * 489) + '"']),
@@ -242,8 +266,8 @@ def cpp_test_contents(fieldtypeobj):
         string hostplat = "x86";
         #endif
 
-        #define ITERS 1
-        #define RUN_CPU
+        #define ITERS 1 // # of times to do accel
+        #define FAST // define this to just do acceleration + checking
 
         std::cout << "s2\\n" << std::flush;
 
@@ -289,25 +313,25 @@ def cpp_test_contents(fieldtypeobj):
 
             block_on_completion();
 
+            // Check if something went wrong
             if ({FENCECHECK}) {{
                 failcheck = true;
             }}
 
+            #ifndef FAST
             auto t2 = std::chrono::steady_clock::now();
             auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
             std::cout << (duration1 / (ITERS * 1.0)) << ", us per iter, " << hostplat << "-accel, {TESTNAME}, " << testvals[0] << "\\n" << std::flush;
 
             std::cout << (((double)(total_bytes_processed)) / (((double)duration1) / 1000000.0)  / 1000000000.0 * 8) << ", Gbits/s, " << hostplat << "-accel, {TESTNAME}, " << testvals[0] << "\\n" << std::flush;
+            #endif
 
             if (failcheck) {{
                 std::cout << "FAIL WRITE NOT IMMEDIATELY VISIBILE OR INCORRECT.\\n" << std::flush;
             }}
 
             for (int q = 0; q < ITERS; q++) {{
-                if (parseintos[q]->{GETTER} != fillmessage->{GETTER}) {{
-                    std::cout << "ACCEL FAILED ITER " << q << " ON {FIELDTYPE} TEST!\\n" << std::flush;
-                    exit(1);
-                }}
+                {CHECK_EQUIV}
                 if (!(parseintos[q]{HASCHECK})) {{
                     std::cout << "ACCEL FAILED hasbits ITER " << q << " ON {FIELDTYPE} TEST!\\n" << std::flush;
                     exit(1);
@@ -316,7 +340,7 @@ def cpp_test_contents(fieldtypeobj):
     #endif
             std::cout << "s5\\n" << std::flush;
 
-            #ifdef RUN_CPU
+            #ifndef FAST
             primitivetests::{MESSAGENAME}* parseintoscpu[ITERS];
 
             for (int q = 0; q < ITERS; q++) {{
@@ -327,17 +351,16 @@ def cpp_test_contents(fieldtypeobj):
             for (int i = 0; i < ITERS; i++) {{
                 parseintoscpu[i]->ParseFromString(newstr[i]);
             }}
-            #endif
 
             auto t4 = std::chrono::steady_clock::now();
-            #ifdef RUN_CPU
             auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
 
             std::cout << (duration2 / (ITERS * 1.0)) << ", us per iter, " << hostplat << ", {TESTNAME}, " << testvals[0] << "\\n" << std::flush;
 
             std::cout << (((double)(total_bytes_processed)) / (((double)duration2) / 1000000.0)  / 1000000000.0 * 8) << ", Gbits/s, " << hostplat << ", {TESTNAME}, " << testvals[0] << "\\n" << std::flush;
 
-            if (fillmessage->{GETTER} != parseintoscpu[ITERS-1]->{GETTER}) {{
+            // only checks 1 elem (TODO: update)
+            if (NUMTESTVALS_NON_MIN != 0 && fillmessage->{GETTER} != parseintoscpu[ITERS-1]->{GETTER}) {{
                 printf("FAILED {FIELDTYPE} test.\\n");
                 exit(1);
             }} else if (!(parseintoscpu[ITERS-1]{HASCHECK})) {{
@@ -353,7 +376,17 @@ def cpp_test_contents(fieldtypeobj):
         google::protobuf::ShutdownProtobufLibrary();
         return 0;
 }}
-""".format(FIELDTYPE=fieldtypeobj.get_fieldname_single_ident(), TESTVALSINIT=fieldtypeobj.generate_testvals_initialized(), SETTERLINES=fieldtypeobj.get_setter_lines(), GETTER=fieldtypeobj.get_getter(0), FENCECHECK=fieldtypeobj.get_fencecheck(), ALLOCFIELDMESSAGE=fieldtypeobj.get_allocator_line(), TESTNAME=fieldtypeobj.get_test_name(), MESSAGENAME=fieldtypeobj.get_message_name(), HASCHECK=fieldtypeobj.get_hascheck(0))
+""".format(
+        CHECK_EQUIV=fieldtypeobj.get_check("parseintos[q]", "fillmessage", """std::cout << "ACCEL FAILED ITER " << q << " ON {FIELDTYPE} TEST!\\n" << std::flush;""".format(FIELDTYPE=fieldtypeobj.get_fieldname_single_ident())),
+        FIELDTYPE=fieldtypeobj.get_fieldname_single_ident(),
+        TESTVALSINIT=fieldtypeobj.generate_testvals_initialized(),
+        SETTERLINES=fieldtypeobj.get_setter_lines(),
+        GETTER=fieldtypeobj.get_getter(0, 0),
+        FENCECHECK=fieldtypeobj.get_fencecheck(),
+        ALLOCFIELDMESSAGE=fieldtypeobj.get_allocator_line(),
+        TESTNAME=fieldtypeobj.get_test_name(),
+        MESSAGENAME=fieldtypeobj.get_message_name(),
+        HASCHECK=fieldtypeobj.get_hascheck(0))
     return contents
 
 def build_cpp_tests(alltestobjs):
