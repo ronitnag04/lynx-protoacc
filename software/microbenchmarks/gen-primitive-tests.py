@@ -266,8 +266,8 @@ def cpp_test_contents(fieldtypeobj):
         string hostplat = "x86";
         #endif
 
-        #define ITERS 1 // # of times to do accel
-        #define FAST // define this to just do acceleration + checking
+        #define ITERS 1000 // # of times to do accel
+        //#define FAST // define this to just do acceleration + checking
 
         std::cout << "s2\\n" << std::flush;
 
