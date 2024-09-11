@@ -1,7 +1,7 @@
 package protoacc.ser
 
-import Chisel._
-import chisel3.{Printable}
+import chisel3._
+import chisel3.util._
 import freechips.rocketchip.tile._
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
@@ -13,20 +13,13 @@ import protoacc._
 class CommandRouterSerializer()(implicit p: Parameters) extends Module {
 
 
-
-  val FUNCT_SFENCE = UInt(0)
-  val FUNCT_HASBITS_SETUP_INFO = UInt(1)
-  val FUNCT_DO_PROTO_SERIALIZE = UInt(2)
-
-
-  val FUNCT_MEM_SETUP = UInt(3)
-  val FUNCT_CHECK_COMPLETION = UInt(4)
+  val fUNCT_SFENCE :: fUNCT_HASBITS_SETUP_INFO :: fUNCT_DO_PROTO_SERIALIZE :: fUNCT_MEM_SETUP :: fUNCT_CHECK_COMPLETION :: Nil = Enum(5)
 
   val io = IO(new Bundle{
-    val rocc_in = Decoupled(new RoCCCommand).flip
+    val rocc_in = Flipped(Decoupled(new RoCCCommand))
     val rocc_out = Decoupled(new RoCCResponse)
 
-    val sfence_out = Bool(OUTPUT)
+    val sfence_out = Output(Bool())
 
 
     val serializer_info_bundle_out = Decoupled(new SerializerInfoBundle)
@@ -41,8 +34,8 @@ class CommandRouterSerializer()(implicit p: Parameters) extends Module {
   })
 
   val track_number_dispatched_parse_commands = RegInit(0.U(64.W))
-  when (io.rocc_in.fire()) {
-    when (io.rocc_in.bits.inst.funct === FUNCT_DO_PROTO_SERIALIZE) {
+  when (io.rocc_in.fire) {
+    when (io.rocc_in.bits.inst.funct === fUNCT_DO_PROTO_SERIALIZE) {
       val next_track_number_dispatched_parse_commands = track_number_dispatched_parse_commands + 1.U
       track_number_dispatched_parse_commands := next_track_number_dispatched_parse_commands
       ProtoaccLogger.logInfo("dispatched bufs: current 0x%x, next 0x%x\n",
@@ -51,12 +44,12 @@ class CommandRouterSerializer()(implicit p: Parameters) extends Module {
     }
   }
 
-  when (io.rocc_in.fire()) {
+  when (io.rocc_in.fire) {
     ProtoaccLogger.logInfo("gotcmd funct %x, rd %x, rs1val %x, rs2val %x\n", io.rocc_in.bits.inst.funct, io.rocc_in.bits.inst.rd, io.rocc_in.bits.rs1, io.rocc_in.bits.rs2)
   }
 
   io.dmem_status_out.bits <> io.rocc_in.bits
-  io.dmem_status_out.valid := io.rocc_in.fire()
+  io.dmem_status_out.valid := io.rocc_in.fire
 
   val hasbits_setup_info_out_queue = Module(new Queue(new RoCCCommand, 2))
   val do_proto_serialize_out_queue = Module(new Queue(new RoCCCommand, 2))
@@ -81,14 +74,14 @@ class CommandRouterSerializer()(implicit p: Parameters) extends Module {
 
   val sfence_fire = DecoupledHelper(
     io.rocc_in.valid,
-    current_funct === FUNCT_SFENCE
+    current_funct === fUNCT_SFENCE
   )
   io.sfence_out := sfence_fire.fire()
 
   val hasbits_info_fire = DecoupledHelper(
     io.rocc_in.valid,
     hasbits_setup_info_out_queue.io.enq.ready,
-    current_funct === FUNCT_HASBITS_SETUP_INFO
+    current_funct === fUNCT_HASBITS_SETUP_INFO
   )
 
   hasbits_setup_info_out_queue.io.enq.valid := hasbits_info_fire.fire(hasbits_setup_info_out_queue.io.enq.ready)
@@ -96,7 +89,7 @@ class CommandRouterSerializer()(implicit p: Parameters) extends Module {
   val do_proto_serialize_fire = DecoupledHelper(
     io.rocc_in.valid,
     do_proto_serialize_out_queue.io.enq.ready,
-    current_funct === FUNCT_DO_PROTO_SERIALIZE
+    current_funct === fUNCT_DO_PROTO_SERIALIZE
   )
 
   do_proto_serialize_out_queue.io.enq.valid := do_proto_serialize_fire.fire(do_proto_serialize_out_queue.io.enq.ready)
@@ -106,7 +99,7 @@ class CommandRouterSerializer()(implicit p: Parameters) extends Module {
 
   val do_alloc_region_addr_fire = DecoupledHelper(
     io.rocc_in.valid,
-    current_funct === FUNCT_MEM_SETUP
+    current_funct === fUNCT_MEM_SETUP
   )
 
   io.stringalloc_region_addr_tail.bits := io.rocc_in.bits.rs1
@@ -118,13 +111,13 @@ class CommandRouterSerializer()(implicit p: Parameters) extends Module {
 
   val do_check_completion_fire = DecoupledHelper(
     io.rocc_in.valid,
-    current_funct === FUNCT_CHECK_COMPLETION,
+    current_funct === fUNCT_CHECK_COMPLETION,
     io.no_writes_inflight,
     io.completed_toplevel_bufs === track_number_dispatched_parse_commands,
     io.rocc_out.ready
   )
 
-  when (io.rocc_in.valid && current_funct === FUNCT_CHECK_COMPLETION) {
+  when (io.rocc_in.valid && current_funct === fUNCT_CHECK_COMPLETION) {
     ProtoaccLogger.logInfo("[commandrouter] WAITING FOR COMPLETION. no_writes_inflight 0x%d, completed 0x%x, dispatched 0x%x, rocc_out.ready 0x%x\n",
       io.no_writes_inflight, io.completed_toplevel_bufs, track_number_dispatched_parse_commands, io.rocc_out.ready)
   }

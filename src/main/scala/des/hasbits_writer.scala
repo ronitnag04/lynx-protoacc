@@ -1,7 +1,7 @@
 package protoacc.des
 
-import Chisel._
-import chisel3.{Printable}
+import chisel3._
+import chisel3.util._
 import freechips.rocketchip.tile._
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
@@ -23,7 +23,7 @@ class HasBitsWriter()(implicit p: Parameters) extends Module
   with MemoryOpConstants {
 
   val io = IO(new Bundle {
-    val requestin = Decoupled(new HasBitsWriteRequest).flip
+    val requestin = Flipped(Decoupled(new HasBitsWriteRequest))
 
     val l1helperUser = new L1MemHelperBundle
   })
@@ -76,7 +76,7 @@ class HasBitsWriter()(implicit p: Parameters) extends Module
       chunk_match
     )
   }
-  when (hasbits_req_buffer.io.deq.fire()) {
+  when (hasbits_req_buffer.io.deq.fire) {
     ProtoaccLogger.logInfo(logprefix + " hasbits write req. consumed\n")
   }
 

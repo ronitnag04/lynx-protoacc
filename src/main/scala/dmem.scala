@@ -1,6 +1,7 @@
 package protoacc
 
-import Chisel._
+import chisel3._
+import chisel3.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.tile.HasCoreParameters
 import freechips.rocketchip.rocket.{HellaCacheReq, TLB, TLBPTWIO, TLBConfig, MStatus, PRV}
@@ -18,23 +19,23 @@ class DmemModuleImp(outer: DmemModule)(implicit p: Parameters) extends LazyModul
   with HasCoreParameters {
 
   val io = IO(new Bundle {
-    val req = Decoupled(new HellaCacheReq).flip
+    val req = Flipped(Decoupled(new HellaCacheReq))
     val mem = Decoupled(new HellaCacheReq)
     val ptw = new TLBPTWIO
-    val status = Valid(new MStatus).flip
-    val sfence = Bool(INPUT)
+    val status = Flipped(Valid(new MStatus))
+    val sfence = Input(Bool())
   })
 
   val (tl, edge) = outer.node.out.head
-  tl.a.valid := Bool(false)
-  tl.b.ready := Bool(true)
-  tl.c.valid := Bool(false)
-  tl.d.ready := Bool(true)
-  tl.e.valid := Bool(false)
+  tl.a.valid := false.B
+  tl.b.ready := true.B
+  tl.c.valid := false.B
+  tl.d.ready := true.B
+  tl.e.valid := false.B
 
   val status = Reg(new MStatus)
   when (io.status.valid) {
-    printf("setting status.dprv to: %x compare %x\n", io.status.bits.dprv, UInt(PRV.M))
+    printf("setting status.dprv to: %x compare %x\n", io.status.bits.dprv, PRV.M.U)
     status := io.status.bits
   }
 
@@ -43,17 +44,17 @@ class DmemModuleImp(outer: DmemModule)(implicit p: Parameters) extends LazyModul
   tlb.io.req.bits.vaddr := io.req.bits.addr
   tlb.io.req.bits.size := io.req.bits.size
   tlb.io.req.bits.cmd := io.req.bits.cmd
-  tlb.io.req.bits.passthrough := Bool(false)
+  tlb.io.req.bits.passthrough := false.B
   val tlb_ready = tlb.io.req.ready && !tlb.io.resp.miss
 
   io.ptw <> tlb.io.ptw
   tlb.io.ptw.status := status
   tlb.io.sfence.valid := io.sfence
-  tlb.io.sfence.bits.rs1 := Bool(false)
-  tlb.io.sfence.bits.rs2 := Bool(false)
-  tlb.io.sfence.bits.addr := UInt(0)
-  tlb.io.sfence.bits.asid := UInt(0)
-  tlb.io.kill := Bool(false)
+  tlb.io.sfence.bits.rs1 := false.B
+  tlb.io.sfence.bits.rs2 := false.B
+  tlb.io.sfence.bits.addr := 0.U
+  tlb.io.sfence.bits.asid := 0.U
+  tlb.io.kill := false.B
 
   io.req.ready := io.mem.ready && tlb_ready
 
@@ -61,7 +62,7 @@ class DmemModuleImp(outer: DmemModule)(implicit p: Parameters) extends LazyModul
   io.mem.bits := io.req.bits
   io.mem.bits.addr := tlb.io.resp.paddr
 
-  io.mem.bits.phys := (status.dprv =/= UInt(PRV.M))
+  io.mem.bits.phys := (status.dprv =/= PRV.M.U)
 
 
 

@@ -1,7 +1,7 @@
 package protoacc
 
-import Chisel._
-import chisel3.{Printable, VecInit}
+import chisel3._
+import chisel3.util._
 import freechips.rocketchip.tile._
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
@@ -177,30 +177,30 @@ object PROTO_TYPES {
 }
 
 class ExtraMetaResponse extends Bundle {
-  val extra_meta0 = UInt(OUTPUT, 64.W)
-  val extra_meta1 = UInt(OUTPUT, 64.W)
+  val extra_meta0 = Output(UInt(64.W))
+  val extra_meta1 = Output(UInt(64.W))
 }
 
 class DescriptorRequest extends Bundle {
-  val proto_addr = UInt(OUTPUT, 64.W)
-  val relative_field_no = UInt(OUTPUT, 64.W)
-  val base_info_ptr = UInt(OUTPUT, 64.W)
+  val proto_addr = Output(UInt(64.W))
+  val relative_field_no = Output(UInt(64.W))
+  val base_info_ptr = Output(UInt(64.W))
 }
 
 class DescriptorResponse extends Bundle {
-  val proto_addr = UInt(OUTPUT, 64.W)
-  val relative_field_no = UInt(OUTPUT, 64.W)
+  val proto_addr = Output(UInt(64.W))
+  val relative_field_no = Output(UInt(64.W))
 
 
-  val is_repeated = Bool(OUTPUT)
-  val proto_field_type = UInt(OUTPUT, PROTO_TYPES.TYPE_fieldwidth)
-  val write_addr = UInt(OUTPUT, 64.W)
+  val is_repeated = Output(Bool())
+  val proto_field_type = Output(UInt(PROTO_TYPES.TYPE_fieldwidth))
+  val write_addr = Output(UInt(64.W))
 }
 
 class DescriptorTableHandler()(implicit p: Parameters) extends Module
   with MemoryOpConstants {
   val io = IO(new Bundle {
-    val field_dest_request = Decoupled(new DescriptorRequest).flip
+    val field_dest_request = Flipped(Decoupled(new DescriptorRequest))
     val field_dest_response = Decoupled(new DescriptorResponse)
     val extra_meta_response = Decoupled(new ExtraMetaResponse)
     val l1helperUser = new L1MemHelperBundle
@@ -229,11 +229,11 @@ class DescriptorTableHandler()(implicit p: Parameters) extends Module
   fieldDestResponseQueue.io.enq.bits.is_repeated := io.l1helperUser.resp.bits.data(63)
 
   l1reqQueue.io.enq.bits.size := log2Ceil(8).U
-  l1reqQueue.io.enq.bits.data := Bits(0)
+  l1reqQueue.io.enq.bits.data := 0.U
 
   l1reqQueue.io.enq.bits.addr := FDR_queue.io.deq.bits.base_info_ptr + (FDR_queue.io.deq.bits.relative_field_no << 4) + 32.U
 
-  val request_outstanding = RegInit(Bool(false))
+  val request_outstanding = RegInit(false.B)
   val no_request_outstanding = !request_outstanding
 
   val fire_request = DecoupledHelper(
@@ -259,28 +259,28 @@ class DescriptorTableHandler()(implicit p: Parameters) extends Module
   io.l1helperUser.resp.ready := fire_response.fire(io.l1helperUser.resp.valid)
 
   when (fire_request.fire()) {
-    request_outstanding := Bool(true)
+    request_outstanding := true.B
   }
 
   val last_descriptor_request = Reg(new DescriptorRequest)
 
   when (fire_response.fire()) {
-    request_outstanding := Bool(false)
+    request_outstanding := false.B
   }
 
-  val sKickOffExtraRequests = UInt(0)
-  val sGetNextDescriptor = UInt(1)
-  val sDescriptorRespWait = UInt(2)
-  val sGetVPtr = UInt(3)
-  val sVPtrWait = UInt(4)
-  val sGetAllocSize = UInt(5)
-  val sAllocSizeWait = UInt(6)
+  val sKickOffExtraRequests = 0.U
+  val sGetNextDescriptor = 1.U
+  val sDescriptorRespWait = 2.U
+  val sGetVPtr = 3.U
+  val sVPtrWait = 4.U
+  val sGetAllocSize = 5.U
+  val sAllocSizeWait = 6.U
   val extraRequestsMode = RegInit(sKickOffExtraRequests)
 
   extraMetaResponseQueue.io.enq.bits.extra_meta0 := io.l1helperUser.resp.bits.data(63, 0)
   extraMetaResponseQueue.io.enq.bits.extra_meta1 := io.l1helperUser.resp.bits.data >> 64
 
-  extraMetaResponseQueue.io.enq.valid := Bool(false)
+  extraMetaResponseQueue.io.enq.valid := false.B
 
   val saved_next_descriptor = RegInit(0.U(64.W))
 
@@ -294,8 +294,8 @@ class DescriptorTableHandler()(implicit p: Parameters) extends Module
       }
     }
     is (sGetNextDescriptor) {
-      l1reqQueue.io.enq.bits.addr := last_descriptor_request.base_info_ptr + 32.U + ((last_descriptor_request.relative_field_no << 4) | UInt(8))
-      l1reqQueue.io.enq.valid := Bool(true)
+      l1reqQueue.io.enq.bits.addr := last_descriptor_request.base_info_ptr + 32.U + ((last_descriptor_request.relative_field_no << 4) | 8.U)
+      l1reqQueue.io.enq.valid := true.B
       when (l1reqQueue.io.enq.ready) {
         extraRequestsMode := sDescriptorRespWait
       }
@@ -305,13 +305,13 @@ class DescriptorTableHandler()(implicit p: Parameters) extends Module
         ProtoaccLogger.logInfo("Got Next Descriptor Table Addr: 0x%x\n", io.l1helperUser.resp.bits.data)
         extraRequestsMode := sGetVPtr
         saved_next_descriptor := io.l1helperUser.resp.bits.data
-        extraMetaResponseQueue.io.enq.valid := Bool(true)
+        extraMetaResponseQueue.io.enq.valid := true.B
       }
-      io.l1helperUser.resp.ready := Bool(true)
+      io.l1helperUser.resp.ready := true.B
     }
     is (sGetVPtr) {
       l1reqQueue.io.enq.bits.addr := saved_next_descriptor
-      l1reqQueue.io.enq.valid := Bool(true)
+      l1reqQueue.io.enq.valid := true.B
       when (l1reqQueue.io.enq.ready) {
         extraRequestsMode := sVPtrWait
       }
@@ -324,14 +324,14 @@ class DescriptorTableHandler()(implicit p: Parameters) extends Module
         ProtoaccLogger.logInfo("Got Nested VPtr: 0x%x\n", nested_vptr)
         ProtoaccLogger.logInfo("Got Nested Size: 0x%x\n", nested_size)
         extraRequestsMode := sGetAllocSize
-        saved_next_descriptor := saved_next_descriptor + UInt(16)
-        extraMetaResponseQueue.io.enq.valid := Bool(true)
+        saved_next_descriptor := saved_next_descriptor + 16.U
+        extraMetaResponseQueue.io.enq.valid := true.B
       }
-      io.l1helperUser.resp.ready := Bool(true)
+      io.l1helperUser.resp.ready := true.B
     }
     is (sGetAllocSize) {
       l1reqQueue.io.enq.bits.addr := saved_next_descriptor
-      l1reqQueue.io.enq.valid := Bool(true)
+      l1reqQueue.io.enq.valid := true.B
       when (l1reqQueue.io.enq.ready) {
         extraRequestsMode := sAllocSizeWait
       }
@@ -345,9 +345,9 @@ class DescriptorTableHandler()(implicit p: Parameters) extends Module
         ProtoaccLogger.logInfo("Got Nested min/max fieldno: 0x%x\n", min_max_fieldno)
 
         extraRequestsMode := sKickOffExtraRequests
-        extraMetaResponseQueue.io.enq.valid := Bool(true)
+        extraMetaResponseQueue.io.enq.valid := true.B
       }
-      io.l1helperUser.resp.ready := Bool(true)
+      io.l1helperUser.resp.ready := true.B
     }
   }
 }

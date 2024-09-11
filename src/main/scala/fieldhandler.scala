@@ -1,7 +1,7 @@
 package protoacc
 
-import Chisel._
-import chisel3.{Printable}
+import chisel3._
+import chisel3.util._
 import freechips.rocketchip.tile._
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
@@ -22,7 +22,7 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
   with MemoryOpConstants {
 
   val io = IO(new Bundle {
-    val ops_in = Decoupled(new DescrToHandlerBundle).flip
+    val ops_in = Flipped(Decoupled(new DescrToHandlerBundle))
     val memread = new L1MemHelperBundle
 
     val writer_output = Decoupled(new WriterBundle)
@@ -34,9 +34,17 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
   val outputQ = Module(new Queue(new WriterBundle, 4))
   io.writer_output <> outputQ.io.deq
   outputQ.io.enq.valid := false.B
+  outputQ.io.enq.bits.data := 0.U
+  outputQ.io.enq.bits.last_for_arbitration_round := 0.U
+  outputQ.io.enq.bits.validbytes := 0.U
+  outputQ.io.enq.bits.depth := 0.U
+  outputQ.io.enq.bits.end_of_message := 0.U
 
   io.memread.req.valid := false.B
   io.memread.req.bits.cmd := M_XRD
+  io.memread.req.bits.addr := 0.U
+  io.memread.req.bits.size := 0.U
+  io.memread.req.bits.data := 0.U
   io.memread.resp.ready := false.B
   io.ops_in.ready := false.B
 
@@ -50,10 +58,10 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
 
   val is_varint_signed_reg = RegInit(false.B)
   val is_int32_reg = RegInit(false.B)
-  val cpp_size_log2_reg = RegInit(UInt(0, 3.W))
+  val cpp_size_log2_reg = RegInit(0.U(3.W))
   val cpp_size_nonlog2_fromreg = 1.U << cpp_size_log2_reg
   val cpp_size_nonlog2_numbits_fromreg = cpp_size_nonlog2_fromreg << 3
-  val wire_type_reg = RegInit(UInt(0, log2Up(5).W))
+  val wire_type_reg = RegInit(0.U(log2Up(5).W))
   val detailedTypeIsPotentiallyScalar_reg = RegInit(false.B)
 
   val src_data_addr_reg = RegInit(0.U(64.W))
@@ -375,11 +383,11 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
 
       val base_addr_bytes = string_data_ptr_reg
       val base_len = io.memread.resp.bits.data
-      val base_addr_start_index = base_addr_bytes & UInt(0xF)
+      val base_addr_start_index = base_addr_bytes & 0xF.U
       val aligned_loadlen = base_len + base_addr_start_index
-      val base_addr_end_index = aligned_loadlen & UInt(0xF)
-      val base_addr_end_index_inclusive = (aligned_loadlen - 1.U) & UInt(0xF)
-      val extra_word = ((aligned_loadlen & UInt(0xF)) =/= UInt(0)).asUInt
+      val base_addr_end_index = aligned_loadlen & 0xF.U
+      val base_addr_end_index_inclusive = (aligned_loadlen - 1.U) & 0xF.U
+      val extra_word = ((aligned_loadlen & 0xF.U) =/= 0.U).asUInt
 
       val base_addr_bytes_aligned = (base_addr_bytes >> 4) << 4
       val words_to_load = (aligned_loadlen >> 4) + extra_word

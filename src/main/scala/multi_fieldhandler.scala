@@ -1,7 +1,7 @@
 package protoacc
 
-import Chisel._
-import chisel3.{Printable}
+import chisel3._
+import chisel3.util._
 import freechips.rocketchip.tile._
 import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
@@ -13,14 +13,14 @@ import freechips.rocketchip.tilelink._
 
 class FieldDispatchRouter(numHandlers: Int)(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
-    val fields_req_in = Decoupled(new DescrToHandlerBundle).flip
+    val fields_req_in = Flipped(Decoupled(new DescrToHandlerBundle))
     val to_fieldhandlers = Vec(numHandlers, Decoupled(new DescrToHandlerBundle))
   })
 
 
   val index = RegInit(0.U(log2Up(numHandlers+1).W))
 
-  val outputQueues = Vec.fill(numHandlers)(Module(new Queue(new DescrToHandlerBundle, 4)).io)
+  val outputQueues = VecInit(Seq.fill(numHandlers)(Module(new Queue(new DescrToHandlerBundle, 4)).io))
 
   for (i <- 0 until numHandlers) {
     io.to_fieldhandlers(i) <> outputQueues(i).deq
@@ -30,7 +30,7 @@ class FieldDispatchRouter(numHandlers: Int)(implicit p: Parameters) extends Modu
   }
   io.fields_req_in.ready := outputQueues(index).enq.ready
 
-  when (io.fields_req_in.fire()) {
+  when (io.fields_req_in.fire) {
     when (index === (numHandlers-1).U) {
       index := 0.U
     } .otherwise {
@@ -43,7 +43,7 @@ class FieldDispatchRouter(numHandlers: Int)(implicit p: Parameters) extends Modu
 
 class MemWriteArbiter(numHandlers: Int)(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
-    val from_fieldhandlers = Vec(numHandlers, Decoupled(new WriterBundle).flip)
+    val from_fieldhandlers = Vec(numHandlers, Flipped(Decoupled(new WriterBundle)))
     val write_reqs_out = Decoupled(new WriterBundle)
   })
 
@@ -57,7 +57,7 @@ class MemWriteArbiter(numHandlers: Int)(implicit p: Parameters) extends Module {
   io.write_reqs_out.valid := io.from_fieldhandlers(index).valid
   io.write_reqs_out.bits := io.from_fieldhandlers(index).bits
 
-  when (io.write_reqs_out.fire() && io.write_reqs_out.bits.last_for_arbitration_round) {
+  when (io.write_reqs_out.fire && io.write_reqs_out.bits.last_for_arbitration_round) {
     when (index === (numHandlers-1).U) {
       index := 0.U
     } .otherwise {

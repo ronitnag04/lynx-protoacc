@@ -1,7 +1,5 @@
 package protoacc
 
-import Chisel._
-
 import org.chipsalliance.cde.config._
 
 import freechips.rocketchip.tile._
