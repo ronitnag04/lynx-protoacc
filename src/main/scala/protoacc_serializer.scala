@@ -12,38 +12,32 @@ import freechips.rocketchip.tilelink._
 
 import protoacc.ser._
 
-class ProtoAccelSerializer(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(
-    opcodes = opcodes, nPTWPorts = 9) {
-  override lazy val module = new ProtoAccelSerializerImp(this)
-
+// note: reduce totalSerFieldHandlers to reduce printfs to synthesize for firesim
+class ProtoAccelSerializer(opcodes: OpcodeSet, totalSerFieldHandlers: Int = 6)(implicit p: Parameters) extends LazyRoCC(
+    opcodes = opcodes, nPTWPorts = 3 + totalSerFieldHandlers) {
+  override lazy val module = new ProtoAccelSerializerImp(this, totalSerFieldHandlers)
 
   val tapeout = true
   val roccTLNode = if (tapeout) atlNode else tlNode
 
+  // protoacc assumes 128b mem. intf (uses TLWidthWidget to adapt to any bus width)
 
   val mem_descr1 = LazyModule(new L1MemHelper(printInfo="[m_serdescr1]", queueRequests=true, queueResponses=true))
   roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_descr1.masterNode
   val mem_descr2 = LazyModule(new L1MemHelper(printInfo="[m_serdescr2]", queueRequests=true))
   roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_descr2.masterNode
 
-  val mem_serfieldhandler1 = LazyModule(new L1MemHelper(printInfo="[m_serfieldhandler1]", queueRequests=true, queueResponses=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serfieldhandler1.masterNode
-  val mem_serfieldhandler2 = LazyModule(new L1MemHelper(printInfo="[m_serfieldhandler2]", queueRequests=true, queueResponses=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serfieldhandler2.masterNode
-  val mem_serfieldhandler3 = LazyModule(new L1MemHelper(printInfo="[m_serfieldhandler3]", queueRequests=true, queueResponses=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serfieldhandler3.masterNode
-  val mem_serfieldhandler4 = LazyModule(new L1MemHelper(printInfo="[m_serfieldhandler4]", queueRequests=true, queueResponses=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serfieldhandler4.masterNode
-  val mem_serfieldhandler5 = LazyModule(new L1MemHelper(printInfo="[m_serfieldhandler5]", queueRequests=true, queueResponses=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serfieldhandler5.masterNode
-  val mem_serfieldhandler6 = LazyModule(new L1MemHelper(printInfo="[m_serfieldhandler6]", queueRequests=true, queueResponses=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serfieldhandler6.masterNode
+  val mem_serfieldhandlers = Seq.tabulate(totalSerFieldHandlers)(i => {
+    val mem_serfieldhandler = LazyModule(new L1MemHelper(printInfo=s"[m_serfieldhandler${i}]", queueRequests=true, queueResponses=true))
+    roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serfieldhandler.masterNode
+    mem_serfieldhandler
+  })
 
   val mem_serwriter = LazyModule(new L1MemHelperWriteFast(printInfo="[m_serwriter]", queueRequests=true))
   roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serwriter.masterNode
 }
 
-class ProtoAccelSerializerImp(outer: ProtoAccelSerializer)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
+class ProtoAccelSerializerImp(outer: ProtoAccelSerializer, totalSerFieldHandlers: Int)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
 with MemoryOpConstants {
 
   io.interrupt := false.B
@@ -75,63 +69,23 @@ with MemoryOpConstants {
 
   ser_descr_tab.io.serializer_cmd_in <> cmd_router.io.serializer_info_bundle_out
 
-  val descr_to_fieldhandler_router = Module(new FieldDispatchRouter(6))
+  val descr_to_fieldhandler_router = Module(new FieldDispatchRouter(totalSerFieldHandlers))
   descr_to_fieldhandler_router.io.fields_req_in <> ser_descr_tab.io.ser_field_handler_output
-  val fieldhandler_to_memwriter_arbiter = Module(new MemWriteArbiter(6))
+  val fieldhandler_to_memwriter_arbiter = Module(new MemWriteArbiter(totalSerFieldHandlers))
 
-  val ser_field_handler1 = Module(new SerFieldHandler("[serfieldhandler1]"))
-  ser_field_handler1.io.ops_in <> descr_to_fieldhandler_router.io.to_fieldhandlers(0)
-  outer.mem_serfieldhandler1.module.io.userif <> ser_field_handler1.io.memread
-  outer.mem_serfieldhandler1.module.io.sfence <> cmd_router.io.sfence_out
-  outer.mem_serfieldhandler1.module.io.status.valid := cmd_router.io.dmem_status_out.valid
-  outer.mem_serfieldhandler1.module.io.status.bits := cmd_router.io.dmem_status_out.bits.status
-  io.ptw(2) <> outer.mem_serfieldhandler1.module.io.ptw
-  fieldhandler_to_memwriter_arbiter.io.from_fieldhandlers(0) <> ser_field_handler1.io.writer_output
-
-  val ser_field_handler2 = Module(new SerFieldHandler("[serfieldhandler2]"))
-  ser_field_handler2.io.ops_in <> descr_to_fieldhandler_router.io.to_fieldhandlers(1)
-  outer.mem_serfieldhandler2.module.io.userif <> ser_field_handler2.io.memread
-  outer.mem_serfieldhandler2.module.io.sfence <> cmd_router.io.sfence_out
-  outer.mem_serfieldhandler2.module.io.status.valid := cmd_router.io.dmem_status_out.valid
-  outer.mem_serfieldhandler2.module.io.status.bits := cmd_router.io.dmem_status_out.bits.status
-  io.ptw(4) <> outer.mem_serfieldhandler2.module.io.ptw
-  fieldhandler_to_memwriter_arbiter.io.from_fieldhandlers(1) <> ser_field_handler2.io.writer_output
-
-  val ser_field_handler3 = Module(new SerFieldHandler("[serfieldhandler3]"))
-  ser_field_handler3.io.ops_in <> descr_to_fieldhandler_router.io.to_fieldhandlers(3-1)
-  outer.mem_serfieldhandler3.module.io.userif <> ser_field_handler3.io.memread
-  outer.mem_serfieldhandler3.module.io.sfence <> cmd_router.io.sfence_out
-  outer.mem_serfieldhandler3.module.io.status.valid := cmd_router.io.dmem_status_out.valid
-  outer.mem_serfieldhandler3.module.io.status.bits := cmd_router.io.dmem_status_out.bits.status
-  io.ptw(5) <> outer.mem_serfieldhandler3.module.io.ptw
-  fieldhandler_to_memwriter_arbiter.io.from_fieldhandlers(3-1) <> ser_field_handler3.io.writer_output
-
-  val ser_field_handler4 = Module(new SerFieldHandler("[serfieldhandler4]"))
-  ser_field_handler4.io.ops_in <> descr_to_fieldhandler_router.io.to_fieldhandlers(4-1)
-  outer.mem_serfieldhandler4.module.io.userif <> ser_field_handler4.io.memread
-  outer.mem_serfieldhandler4.module.io.sfence <> cmd_router.io.sfence_out
-  outer.mem_serfieldhandler4.module.io.status.valid := cmd_router.io.dmem_status_out.valid
-  outer.mem_serfieldhandler4.module.io.status.bits := cmd_router.io.dmem_status_out.bits.status
-  io.ptw(6) <> outer.mem_serfieldhandler4.module.io.ptw
-  fieldhandler_to_memwriter_arbiter.io.from_fieldhandlers(4-1) <> ser_field_handler4.io.writer_output
-
-  val ser_field_handler5 = Module(new SerFieldHandler("[serfieldhandler5]"))
-  ser_field_handler5.io.ops_in <> descr_to_fieldhandler_router.io.to_fieldhandlers(5-1)
-  outer.mem_serfieldhandler5.module.io.userif <> ser_field_handler5.io.memread
-  outer.mem_serfieldhandler5.module.io.sfence <> cmd_router.io.sfence_out
-  outer.mem_serfieldhandler5.module.io.status.valid := cmd_router.io.dmem_status_out.valid
-  outer.mem_serfieldhandler5.module.io.status.bits := cmd_router.io.dmem_status_out.bits.status
-  io.ptw(7) <> outer.mem_serfieldhandler5.module.io.ptw
-  fieldhandler_to_memwriter_arbiter.io.from_fieldhandlers(5-1) <> ser_field_handler5.io.writer_output
-
-  val ser_field_handler6 = Module(new SerFieldHandler("[serfieldhandler6]"))
-  ser_field_handler6.io.ops_in <> descr_to_fieldhandler_router.io.to_fieldhandlers(6-1)
-  outer.mem_serfieldhandler6.module.io.userif <> ser_field_handler6.io.memread
-  outer.mem_serfieldhandler6.module.io.sfence <> cmd_router.io.sfence_out
-  outer.mem_serfieldhandler6.module.io.status.valid := cmd_router.io.dmem_status_out.valid
-  outer.mem_serfieldhandler6.module.io.status.bits := cmd_router.io.dmem_status_out.bits.status
-  io.ptw(8) <> outer.mem_serfieldhandler6.module.io.ptw
-  fieldhandler_to_memwriter_arbiter.io.from_fieldhandlers(6-1) <> ser_field_handler6.io.writer_output
+  // technically this has only been tested with ptw ports 2, 4, 5, ... (where 3 was given to the memwriter)
+  val ser_field_handlers = Seq.tabulate(totalSerFieldHandlers)(i => {
+    val ser_field_handler = Module(new SerFieldHandler(s"[serfieldhandler${i}]"))
+    ser_field_handler.io.ops_in <> descr_to_fieldhandler_router.io.to_fieldhandlers(i)
+    val mem_serfieldhandler = outer.mem_serfieldhandlers(i)
+    mem_serfieldhandler.module.io.userif <> ser_field_handler.io.memread
+    mem_serfieldhandler.module.io.sfence <> cmd_router.io.sfence_out
+    mem_serfieldhandler.module.io.status.valid := cmd_router.io.dmem_status_out.valid
+    mem_serfieldhandler.module.io.status.bits := cmd_router.io.dmem_status_out.bits.status
+    io.ptw(3 + i) <> mem_serfieldhandler.module.io.ptw
+    fieldhandler_to_memwriter_arbiter.io.from_fieldhandlers(i) <> ser_field_handler.io.writer_output
+    ser_field_handler
+  })
 
   val ser_memwriter = Module(new SerMemwriter)
   ser_memwriter.io.stringobj_output_addr <> cmd_router.io.stringalloc_region_addr_tail
@@ -143,7 +97,7 @@ with MemoryOpConstants {
   outer.mem_serwriter.module.io.sfence <> cmd_router.io.sfence_out
   outer.mem_serwriter.module.io.status.valid := cmd_router.io.dmem_status_out.valid
   outer.mem_serwriter.module.io.status.bits := cmd_router.io.dmem_status_out.bits.status
-  io.ptw(3) <> outer.mem_serwriter.module.io.ptw
+  io.ptw(2) <> outer.mem_serwriter.module.io.ptw
 
   cmd_router.io.no_writes_inflight := !(ser_memwriter.io.mem_work_outstanding)
   cmd_router.io.completed_toplevel_bufs := ser_memwriter.io.messages_completed

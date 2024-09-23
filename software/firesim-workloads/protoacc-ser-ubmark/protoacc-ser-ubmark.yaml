@@ -4,6 +4,6 @@
   "workdir" : ".",
   "overlay" : "overlay",
   "rootfs-size" : "1G",
-  "linux-config" : "kfrag",
+#"linux-config" : "kfrag",
   "run" : "overlay/root/ubmarks/top-run.sh"
 }

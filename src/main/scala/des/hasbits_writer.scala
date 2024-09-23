@@ -90,6 +90,8 @@ class HasBitsWriter()(implicit p: Parameters) extends Module
   io.l1helperUser.resp.ready := false.B
   io.l1helperUser.req.bits.size := 2.U
   io.l1helperUser.req.bits.data := in_progress_chunk
+  io.l1helperUser.req.bits.cmd := 0.U
+  io.l1helperUser.req.bits.addr := 0.U
 
   val issued_write = RegInit(false.B)
 

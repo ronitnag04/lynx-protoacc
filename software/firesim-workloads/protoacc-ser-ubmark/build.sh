@@ -6,7 +6,6 @@ set -ex
 
 CFG=protoacc-ser-ubmark.yaml
 
-# use initramfs so that you can use checkpointing
-marshal -v -d clean $CFG
-marshal -v -d build $CFG
-marshal -v -d install $CFG
+marshal -v clean $CFG
+marshal -v build $CFG
+marshal -v install $CFG

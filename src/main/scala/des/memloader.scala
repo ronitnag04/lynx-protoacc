@@ -141,8 +141,10 @@ class MemLoader()(implicit p: Parameters) extends Module
   val QUEUE_DEPTHS = 16 * 4
   val write_start_index = RegInit(0.U(log2Up(NUM_QUEUES+1).W))
   val mem_resp_queues = VecInit(Seq.fill(NUM_QUEUES)(Module(new Queue(UInt(8.W), QUEUE_DEPTHS)).io))
-
-
+  for (queueno <- 0 until NUM_QUEUES) {
+    mem_resp_queues(queueno).enq.bits := 0.U
+    mem_resp_queues(queueno).deq.ready := false.B
+  }
 
   val align_shamt = (load_info_queue.io.deq.bits.start_byte << 3)
   val memresp_bits_shifted = io.l1helperUser.resp.bits.data >> align_shamt

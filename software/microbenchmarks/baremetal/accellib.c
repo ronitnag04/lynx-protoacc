@@ -1,5 +1,6 @@
 #include "accellib.h"
-#include <cassert>
+#include <assert.h>
+#include <stdio.h>
 #include <malloc.h>
 
 #define PAGESIZE_BYTES 4096
@@ -13,7 +14,7 @@
 #endif
 
 // disable prints
-#define printf(...) (0)
+//#define printf(...) (0)
 
 void AccelSetupFixedAllocRegion() {
     asm volatile ("addi x0, x1, 0");
@@ -46,54 +47,48 @@ void AccelSetup() {
     AccelSetupFixedAllocRegion();
 }
 
-inline void touch_all_pages(char* region, size_t max_bytes) {
+static inline void touch_all_pages(char* region, size_t max_bytes) {
     for (uint64_t i = 0; i < max_bytes; i += PAGESIZE_BYTES) {
         region[i] = 0;
     }
 }
 
-inline size_t make_multiple_of(size_t in, size_t multiple_of) {
-    assert(multiple_of >= 0);
-    return ((in + multiple_of - 1) / multiple_of) * multiple_of;
-}
-
 volatile char ** AccelSetupAllocRegionSerializer(size_t num_string_pointers, size_t total_string_data_bytes) {
-    printf("SerSetupReq: NumStrs:%ld TotalBytes:%ld\n", num_string_pointers, total_string_data_bytes);
-
     ROCC_INSTRUCTION(PROTOACC_SER_OPCODE, FUNCT_SER_SFENCE);
 
     // string data allocation
 
-    size_t string_data_region_size = make_multiple_of(sizeof(char) * total_string_data_bytes, MAX_BUS_WIDTH); // round up to nearest multiple of MAX_BUS_WIDTH (buswidth) (also 64 since accelerator deals with 64 only)
+    size_t string_data_region_size = sizeof(char) * total_string_data_bytes;
+    string_data_region_size = ((string_data_region_size + 64 - 1) / 64) * 64;
     // align to page
     char* string_data_region = (char*)memalign(PAGESIZE_BYTES, string_data_region_size);
-    uint64_t string_data_region_ptr_as_int = (uint64_t)string_data_region;
-    uint64_t string_data_region_ptr_as_int_tail = string_data_region_ptr_as_int + (uint64_t)string_data_region_size;
-    printf("StringDataRegion Start::0x%llx Tail:0x%llx\n", string_data_region_ptr_as_int, string_data_region_ptr_as_int_tail);
-
     // touch each page (so it's paged in)
     touch_all_pages(string_data_region, string_data_region_size);
 
+    // helpers
+    uint64_t string_data_region_ptr_as_int = (uint64_t)string_data_region;
+    uint64_t string_data_region_ptr_as_int_tail = string_data_region_ptr_as_int + (uint64_t)string_data_region_size;
+
     // string pointer allocation
 
-    size_t string_pointer_region_size = make_multiple_of(num_string_pointers * sizeof(char*), MAX_BUS_WIDTH); // round up to nearest multiple of MAX_BUS_WIDTH (buswidth) (also 64 since accelerator deals with 64 only)
+    size_t string_pointer_region_size = num_string_pointers * sizeof(char*);
     // align to page
     char** string_pointer_region = (char**)memalign(PAGESIZE_BYTES, string_pointer_region_size);
-
     // touch each page (so it's paged in)
     touch_all_pages((char*)string_pointer_region, string_pointer_region_size);
 
     // TODO: unsure
     string_pointer_region[0] = (char*)string_data_region_ptr_as_int_tail;
     string_pointer_region += 1;
+
     uint64_t string_pointer_region_ptr_as_int = (uint64_t)string_pointer_region;
 
     ROCC_INSTRUCTION_SS(PROTOACC_SER_OPCODE, string_data_region_ptr_as_int_tail, string_pointer_region_ptr_as_int, FUNCT_SER_MEM_SETUP);
     assert((string_data_region_ptr_as_int_tail & 0x7) == 0x0);
     assert((string_pointer_region_ptr_as_int & 0x7) == 0x0);
 
-    printf("StringDataRegion: %lld bytes alloc'ed, tail at 0x%016llx\n", (uint64_t)string_data_region_size, string_data_region_ptr_as_int_tail);
-    printf("StringPtrRegion: %lld byte alloc'ed, starting at 0x%016llx\n", (uint64_t)string_pointer_region_size, string_pointer_region_ptr_as_int);
+    printf("accelerator given %ld byte region, tail at 0x%016lx for string alloc\n", (uint64_t)string_data_region_size, string_data_region_ptr_as_int_tail);
+    printf("accelerator given %ld byte region, starting at 0x%016lx for string ptr alloc\n", (uint64_t)string_pointer_region_size, string_pointer_region_ptr_as_int);
 
     return (volatile char**)string_pointer_region;
 }
@@ -146,6 +141,8 @@ volatile char * BlockOnSerializedValue(volatile char ** ptrs, int index) {
     ROCC_INSTRUCTION_D(PROTOACC_SER_OPCODE, retval, FUNCT_SER_CHECK_COMPLETION);
     asm volatile ("fence");
 
+    printf("SerAcc: StartLoop: inptr: %p, index: %d, loopaddr: %p, valat0: 0x%lx %p\n", ptrs, index, &ptrs[index], (uint64_t)ptrs[0], &ptrs[0]);
+
     int i = 0;
     while (ptrs[index] == 0) {
         asm volatile ("fence");
@@ -157,28 +154,28 @@ size_t GetSerializedLength(volatile char ** ptrs, int index) {
     return (size_t)(ptrs[index-1] - ptrs[index]);
 }
 
-void AccelParseFromString_Helper(const void * descriptor_table_ptr, void * dest_base_addr,
-                          const std::string* inputstr) {
-    AccelParseFromString_Helper(descriptor_table_ptr, dest_base_addr, *inputstr);
-}
-
-void AccelParseFromString_Helper(const void * descriptor_table_ptr, void * dest_base_addr,
-                          const std::string& inputstr) {
-    const void * base_ptr = inputstr.c_str();
-    uint64_t input_length = inputstr.length();
-    if (input_length == 0) {
-        return;
-    }
-
-    uint64_t* access_descr_ptr = (uint64_t*)descriptor_table_ptr;
-    uint64_t min_field_no = access_descr_ptr[3] >> 32;
-    uint64_t low32_mask_internal = 0x00000000FFFFFFFFL;
-    uint64_t min_field_no_and_input_length = (min_field_no << 32) | (input_length & low32_mask_internal);
-
-    ROCC_INSTRUCTION_SS(PROTOACC_OPCODE, descriptor_table_ptr, dest_base_addr, FUNCT_PROTO_PARSE_INFO);
-    ROCC_INSTRUCTION_SS(PROTOACC_OPCODE, base_ptr, min_field_no_and_input_length, FUNCT_DO_PROTO_PARSE);
-
-}
+//void AccelParseFromString_Helper(const void * descriptor_table_ptr, void * dest_base_addr,
+//                          const std::string* inputstr) {
+//    AccelParseFromString_Helper(descriptor_table_ptr, dest_base_addr, *inputstr);
+//}
+//
+//void AccelParseFromString_Helper(const void * descriptor_table_ptr, void * dest_base_addr,
+//                          const std::string& inputstr) {
+//    const void * base_ptr = inputstr.c_str();
+//    uint64_t input_length = inputstr.length();
+//    if (input_length == 0) {
+//        return;
+//    }
+//
+//    uint64_t* access_descr_ptr = (uint64_t*)descriptor_table_ptr;
+//    uint64_t min_field_no = access_descr_ptr[3] >> 32;
+//    uint64_t low32_mask_internal = 0x00000000FFFFFFFFL;
+//    uint64_t min_field_no_and_input_length = (min_field_no << 32) | (input_length & low32_mask_internal);
+//
+//    ROCC_INSTRUCTION_SS(PROTOACC_OPCODE, descriptor_table_ptr, dest_base_addr, FUNCT_PROTO_PARSE_INFO);
+//    ROCC_INSTRUCTION_SS(PROTOACC_OPCODE, base_ptr, min_field_no_and_input_length, FUNCT_DO_PROTO_PARSE);
+//
+//}
 
 uint64_t block_on_completion() {
     uint64_t retval;

@@ -1,7 +1,9 @@
 #include "rocc.h"
 
-#include <string>
-#include <cstdint>
+//#include <string>
+//#include <cstdint>
+#include <stdint.h>
+#include <stddef.h>
 
 #define PROTOACC_OPCODE 2
 #define FUNCT_SFENCE 0
@@ -21,15 +23,15 @@ void AccelSetup();
 volatile char ** AccelSetupSerializer();
 volatile char ** AccelSetupAllocRegionSerializer(size_t num_string_pointers, size_t total_string_data_bytes);
 
-#define AccelParseFromString(filename, msgtype, dest, inputstr) \
-    AccelParseFromString_Helper(filename##_FriendStruct_##msgtype##_ACCEL_DESCRIPTORS::msgtype##_ACCEL_DESCRIPTORS, \
-        dest, inputstr);
-
-void AccelParseFromString_Helper(const void * descriptor_table_ptr, void * dest_base_addr,
-                          const std::string* inputstr);
-
-void AccelParseFromString_Helper(const void * descriptor_table_ptr, void * dest_base_addr,
-                          const std::string& inputstr);
+//#define AccelParseFromString(filename, msgtype, dest, inputstr) \
+//    AccelParseFromString_Helper(filename##_FriendStruct_##msgtype##_ACCEL_DESCRIPTORS::msgtype##_ACCEL_DESCRIPTORS, \
+//        dest, inputstr);
+//
+//void AccelParseFromString_Helper(const void * descriptor_table_ptr, void * dest_base_addr,
+//                          const std::string* inputstr);
+//
+//void AccelParseFromString_Helper(const void * descriptor_table_ptr, void * dest_base_addr,
+//                          const std::string& inputstr);
 
 #define AccelSerializeToString(filename, msgtype, src) \
     AccelSerializeToString_Helper(filename##_FriendStruct_##msgtype##_ACCEL_DESCRIPTORS::msgtype##_ACCEL_DESCRIPTORS, \
