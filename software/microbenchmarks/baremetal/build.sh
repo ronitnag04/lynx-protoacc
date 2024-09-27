@@ -12,6 +12,6 @@ ACCELLIB_DIR=$PWD
 #	-o custom.riscv \
 VARS=
 
-riscv64-unknown-elf-gcc -DACCEL_REGION_DEFAULT_SHIFT=13 -DACCEL_REGION_SER_SHIFT=13 -fno-common -fno-builtin-printf -specs=htif_nano.specs -c custom.c $VARS
-riscv64-unknown-elf-gcc -DACCEL_REGION_DEFAULT_SHIFT=13 -DACCEL_REGION_SER_SHIFT=13 -fno-common -fno-builtin-printf -specs=htif_nano.specs -c accellib.c $VARS
-riscv64-unknown-elf-gcc -DACCEL_REGION_DEFAULT_SHIFT=13 -DACCEL_REGION_SER_SHIFT=13 -static -specs=htif_nano.specs custom.o accellib.o -o custom.riscv $VARS
+riscv64-unknown-elf-gcc -DUSE_REROCC -DACCEL_REGION_DEFAULT_SHIFT=13 -DACCEL_REGION_SER_SHIFT=13 -fno-common -fno-builtin-printf -specs=htif_nano.specs -c custom.c $VARS
+riscv64-unknown-elf-gcc -DUSE_REROCC -DACCEL_REGION_DEFAULT_SHIFT=13 -DACCEL_REGION_SER_SHIFT=13 -fno-common -fno-builtin-printf -specs=htif_nano.specs -c accellib.c $VARS
+riscv64-unknown-elf-gcc -DUSE_REROCC -DACCEL_REGION_DEFAULT_SHIFT=13 -DACCEL_REGION_SER_SHIFT=13 -static -specs=htif_nano.specs custom.o accellib.o -o custom.riscv $VARS

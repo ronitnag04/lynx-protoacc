@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 #include "accellib.h"
+#include "rerocc.h"
 
 void mark() {
     static int count = 0;
@@ -44,6 +45,17 @@ int main() {
 
     mark();
 
+#ifdef USE_REROCC
+    #define REROCC_CFG_ID 0
+    if (rr_acquire_single(REROCC_CFG_ID/*cfgreg*/, 1/*tileId=ser*/)) {
+        printf("Acquired accelerator %ld to cfg %d\n", read_rr_csr(CSR_RRCFG0 + REROCC_CFG_ID) & RR_CFG_MGR_MASK, REROCC_CFG_ID);
+    } else {
+        printf("Failed to acquire cfg %d\n", REROCC_CFG_ID);
+        return 1;
+    }
+    rr_set_opc(PROTOACC_SER_OPCODE/*accelopcode*/, REROCC_CFG_ID/*cfgreg*/);
+    printf("Set cfg %d to accel opcode %d\n", REROCC_CFG_ID, PROTOACC_SER_OPCODE);
+#endif
     volatile char** serializeoutputs = AccelSetupAllocRegionSerializer(200, 200);
     printf("Region: %p\n", serializeoutputs);
     printf("Region: %p\n", &serializeoutputs[0]);
@@ -53,6 +65,9 @@ int main() {
     AccelSerializeToString_Helper(accel_desc, (void*)msg_data);
     volatile char * serres = BlockOnSerializedValue(serializeoutputs, 0);
     size_t serlen = GetSerializedLength(serializeoutputs, 0);
+#ifdef USE_REROCC
+    rr_release(REROCC_CFG_ID);
+#endif
 
     printf("ACCEL: SERIALIZEDLENGTH: %d, SERPTR: %p\n", serlen, serres);
     for (int l = 0; l < serlen; l++) {

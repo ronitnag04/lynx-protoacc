@@ -54,6 +54,7 @@ static inline void touch_all_pages(char* region, size_t max_bytes) {
 }
 
 volatile char ** AccelSetupAllocRegionSerializer(size_t num_string_pointers, size_t total_string_data_bytes) {
+    printf("SerAcc: SFENCE\n");
     ROCC_INSTRUCTION(PROTOACC_SER_OPCODE, FUNCT_SER_SFENCE);
 
     // string data allocation
@@ -83,6 +84,7 @@ volatile char ** AccelSetupAllocRegionSerializer(size_t num_string_pointers, siz
 
     uint64_t string_pointer_region_ptr_as_int = (uint64_t)string_pointer_region;
 
+    printf("SerAcc: OutputMemRegionSetup\n");
     ROCC_INSTRUCTION_SS(PROTOACC_SER_OPCODE, string_data_region_ptr_as_int_tail, string_pointer_region_ptr_as_int, FUNCT_SER_MEM_SETUP);
     assert((string_data_region_ptr_as_int_tail & 0x7) == 0x0);
     assert((string_pointer_region_ptr_as_int & 0x7) == 0x0);
