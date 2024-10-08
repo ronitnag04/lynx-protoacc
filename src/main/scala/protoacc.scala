@@ -9,25 +9,61 @@ import freechips.rocketchip.rocket.{TLBConfig, HellaCacheArbiter}
 import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 import freechips.rocketchip.tilelink._
+import freechips.rocketchip.subsystem.{CacheBlockBytes}
 
 import protoacc.des._
+
+class ScratchpadBank(subBanks: Int, address: AddressSet, beatBytes: Int, buffer: BufferParams)(implicit p: Parameters) extends LazyModule {
+  val mask = (subBanks - 1) * p(CacheBlockBytes)
+  val xbar = TLXbar()
+  (0 until subBanks).map { sb =>
+    val ram = LazyModule(new TLRAM(
+      address = AddressSet(address.base + sb * p(CacheBlockBytes), address.mask - mask),
+      beatBytes = beatBytes,
+      ) {
+      override lazy val desiredName = s"TLRAM_ScratchpadBank"
+    })
+    ram.node :=  TLFragmenter(beatBytes, p(CacheBlockBytes), nameSuffix = Some("ScratchpadBank")) := TLBuffer(buffer) := xbar
+  }
+  override lazy val desiredName = "ScratchpadBank"
+  lazy val module = new LazyModuleImp(this) {}
+}
 
 class ProtoAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(
     opcodes = opcodes, nPTWPorts = 4) {
   override lazy val module = new ProtoAccelImp(this)
 
-  val tapeout = true
-  val roccTLNode = if (tapeout) atlNode else tlNode
+  val spad_xbar = LazyModule(new TLXbar)
+  spad_xbar.node := TLBuffer() := stlNode
 
+  // input multi-banked globally visible scratchpad
+  val banks = 1
+  val subbanks = 1
+  val bankStripe = p(CacheBlockBytes)*subbanks
+  val mask = (banks-1)*bankStripe
+  val base = 0x40000000L
+  val size = 4 << 20 /*4MB*/
+  val busBeatBytes = 16
+  (0 until banks).map { b =>
+    val bank = LazyModule(new ScratchpadBank(
+        subbanks,
+        AddressSet(base + bankStripe * b, size - 1 - mask),
+        busBeatBytes,
+        BufferParams.default))
+    bank.xbar := TLBuffer(BufferParams.default) := spad_xbar.node
+  }
+
+  val xbar = LazyModule(new TLXbar)
+  atlNode := TLWidthWidget(16) := xbar.node
 
   val mem_descr = LazyModule(new L1MemHelper("[m_descr]", numOutstandingReqs=4))
-  roccTLNode := TLWidthWidget(16):= TLBuffer.chainNode(1) := mem_descr.masterNode
+  xbar.node := TLBuffer.chainNode(1) := mem_descr.masterNode
   val mem_memloader = LazyModule(new L1MemHelper("[m_memloader]", numOutstandingReqs=64, queueResponses=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_memloader.masterNode
+  xbar.node := TLBuffer.chainNode(1) := mem_memloader.masterNode
   val mem_hasbits = LazyModule(new L1MemHelper(printInfo="[m_hasbits]", queueRequests=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_hasbits.masterNode
+  xbar.node := TLBuffer.chainNode(1) := mem_hasbits.masterNode
   val mem_fixedwriter = LazyModule(new L1MemHelperWriteFast(printInfo="[m_fixedwriter]", queueRequests=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_fixedwriter.masterNode
+  xbar.node := TLBuffer.chainNode(1) := mem_fixedwriter.masterNode
 }
 
 
