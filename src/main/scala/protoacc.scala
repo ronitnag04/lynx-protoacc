@@ -1,61 +1,33 @@
 package protoacc
 
+import scala.collection.immutable.{ListMap}
+
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.tile._
+
 import org.chipsalliance.cde.config._
+
+import freechips.rocketchip.tile._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.rocket.{TLBConfig, HellaCacheArbiter}
 import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.subsystem.{CacheBlockBytes}
+import freechips.rocketchip.resources.{DiplomacyUtils}
+
+import testchipip.soc.{BankedScratchpadParams}
 
 import protoacc.des._
 
-class ScratchpadBank(subBanks: Int, address: AddressSet, beatBytes: Int, buffer: BufferParams)(implicit p: Parameters) extends LazyModule {
-  val mask = (subBanks - 1) * p(CacheBlockBytes)
-  val xbar = TLXbar()
-  (0 until subBanks).map { sb =>
-    val ram = LazyModule(new TLRAM(
-      address = AddressSet(address.base + sb * p(CacheBlockBytes), address.mask - mask),
-      beatBytes = beatBytes,
-      ) {
-      override lazy val desiredName = s"TLRAM_ScratchpadBank"
-    })
-    ram.node :=  TLFragmenter(beatBytes, p(CacheBlockBytes), nameSuffix = Some("ScratchpadBank")) := TLBuffer(buffer) := xbar
-  }
-  override lazy val desiredName = "ScratchpadBank"
-  lazy val module = new LazyModuleImp(this) {}
-}
-
-class ProtoAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(
+class ProtoAccel(opcodes: OpcodeSet, spadParams: Option[BankedScratchpadParams] = None)(implicit p: Parameters) extends LazyRoCC(
     opcodes = opcodes, nPTWPorts = 4) {
   override lazy val module = new ProtoAccelImp(this)
-
-  val spad_xbar = LazyModule(new TLXbar)
-  spad_xbar.node := TLBuffer() := stlNode
-
-  // input multi-banked globally visible scratchpad
-  val banks = 1
-  val subbanks = 1
-  val bankStripe = p(CacheBlockBytes)*subbanks
-  val mask = (banks-1)*bankStripe
-  val base = 0x40000000L
-  val size = 4 << 20 /*4MB*/
-  val busBeatBytes = 16
-  (0 until banks).map { b =>
-    val bank = LazyModule(new ScratchpadBank(
-        subbanks,
-        AddressSet(base + bankStripe * b, size - 1 - mask),
-        busBeatBytes,
-        BufferParams.default))
-    bank.xbar := TLBuffer(BufferParams.default) := spad_xbar.node
-  }
+  //chisel3.experimental.annotate(midas.targetutils.EnableModelMultiThreadingAnnotation(module))
 
   val xbar = LazyModule(new TLXbar)
-  atlNode := TLWidthWidget(16) := xbar.node
 
+  // acc. memory accessors
   val mem_descr = LazyModule(new L1MemHelper("[m_descr]", numOutstandingReqs=4))
   xbar.node := TLBuffer.chainNode(1) := mem_descr.masterNode
   val mem_memloader = LazyModule(new L1MemHelper("[m_memloader]", numOutstandingReqs=64, queueResponses=true))
@@ -64,6 +36,46 @@ class ProtoAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(
   xbar.node := TLBuffer.chainNode(1) := mem_hasbits.masterNode
   val mem_fixedwriter = LazyModule(new L1MemHelperWriteFast(printInfo="[m_fixedwriter]", queueRequests=true))
   xbar.node := TLBuffer.chainNode(1) := mem_fixedwriter.masterNode
+
+  val busBeatBytes = 16
+  val intNode = spadParams match {
+    case Some(BankedScratchpadParams(base, size, _, banks, subbanks, _, _, _, _, _)) => {
+      val spad_xbar = LazyModule(new TLXbar).suggestName("protoaccdes_spad_xbar")
+
+      // input multi-banked globally visible scratchpad
+      val bankStripe = p(CacheBlockBytes)*subbanks
+      val mask = (banks-1)*bankStripe
+      val device = new MemoryDevice {
+        override def describe(resources: ResourceBindings): Description = {
+          Description(describeName("memory", resources), ListMap(
+            "reg"         -> resources.map.filterKeys(DiplomacyUtils.regFilter).flatMap(_._2).map(_.value).toList,
+            "device_type" -> Seq(ResourceString("memory")),
+            "status"      -> Seq(ResourceString("okay"))
+          ))
+        }
+      }
+      (0 until banks).map { b =>
+        val bank = LazyModule(new testchipip.soc.ScratchpadBankNonClockDiplomatic(
+            subbanks,
+            AddressSet(base + bankStripe * b, size - 1 - mask),
+            busBeatBytes,
+            device,
+            BufferParams.default))
+        bank.xbar := TLBuffer(BufferParams.default) := spad_xbar.node
+      }
+
+      // let outer memory come to scratchpad
+      spad_xbar.node := TLBuffer() := TLWidthWidget(busBeatBytes) := stlNode
+      // allow mem. reqs. to go to spad w/o going out to sbus
+      spad_xbar.node := TLWidthWidget(busBeatBytes) := xbar.node
+
+      TLFilter(TLFilter.mSubtract(Seq(AddressSet(base, size-1))))
+    }
+    case None => TLIdentityNode()
+  }
+
+  // let acc mem. reqs come be sent out (filter out all from spad)
+  atlNode := intNode := TLWidthWidget(busBeatBytes) := xbar.node
 }
 
 

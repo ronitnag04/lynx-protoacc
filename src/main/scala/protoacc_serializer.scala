@@ -1,40 +1,87 @@
 package protoacc
 
+import scala.collection.immutable.{ListMap}
+
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.tile._
+
 import org.chipsalliance.cde.config._
+
+import freechips.rocketchip.tile._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.rocket.{TLBConfig}
 import freechips.rocketchip.util.DecoupledHelper
 import freechips.rocketchip.rocket.constants.MemoryOpConstants
 import freechips.rocketchip.tilelink._
+import freechips.rocketchip.subsystem.{CacheBlockBytes}
+import freechips.rocketchip.resources.{DiplomacyUtils}
+
+import testchipip.soc.{BankedScratchpadParams}
 
 import protoacc.ser._
 
 // note: reduce totalSerFieldHandlers to reduce printfs to synthesize for firesim
-class ProtoAccelSerializer(opcodes: OpcodeSet, totalSerFieldHandlers: Int = 6)(implicit p: Parameters) extends LazyRoCC(
+class ProtoAccelSerializer(opcodes: OpcodeSet, spadParams: Option[BankedScratchpadParams] = None, totalSerFieldHandlers: Int = 6)(implicit p: Parameters) extends LazyRoCC(
     opcodes = opcodes, nPTWPorts = 3 + totalSerFieldHandlers) {
   override lazy val module = new ProtoAccelSerializerImp(this, totalSerFieldHandlers)
+  //chisel3.experimental.annotate(midas.targetutils.EnableModelMultiThreadingAnnotation(module))
 
-  val tapeout = true
-  val roccTLNode = if (tapeout) atlNode else tlNode
+  val xbar = LazyModule(new TLXbar).suggestName("protoaccser_spad_xbar")
 
   // protoacc assumes 128b mem. intf (uses TLWidthWidget to adapt to any bus width)
-
   val mem_descr1 = LazyModule(new L1MemHelper(printInfo="[m_serdescr1]", queueRequests=true, queueResponses=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_descr1.masterNode
+  xbar.node := TLBuffer.chainNode(1) := mem_descr1.masterNode
   val mem_descr2 = LazyModule(new L1MemHelper(printInfo="[m_serdescr2]", queueRequests=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_descr2.masterNode
+  xbar.node := TLBuffer.chainNode(1) := mem_descr2.masterNode
 
   val mem_serfieldhandlers = Seq.tabulate(totalSerFieldHandlers)(i => {
     val mem_serfieldhandler = LazyModule(new L1MemHelper(printInfo=s"[m_serfieldhandler${i}]", queueRequests=true, queueResponses=true))
-    roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serfieldhandler.masterNode
+    xbar.node := TLBuffer.chainNode(1) := mem_serfieldhandler.masterNode
     mem_serfieldhandler
   })
 
   val mem_serwriter = LazyModule(new L1MemHelperWriteFast(printInfo="[m_serwriter]", queueRequests=true))
-  roccTLNode := TLWidthWidget(16) := TLBuffer.chainNode(1) := mem_serwriter.masterNode
+  xbar.node := TLBuffer.chainNode(1) := mem_serwriter.masterNode
+
+  val busBeatBytes = 16
+  val intNode = spadParams match {
+    case Some(BankedScratchpadParams(base, size, _, banks, subbanks, _, _, _, _, _)) => {
+      val spad_xbar = LazyModule(new TLXbar)
+
+      // input multi-banked globally visible scratchpad
+      val bankStripe = p(CacheBlockBytes)*subbanks
+      val mask = (banks-1)*bankStripe
+      val device = new MemoryDevice {
+        override def describe(resources: ResourceBindings): Description = {
+          Description(describeName("memory", resources), ListMap(
+            "reg"         -> resources.map.filterKeys(DiplomacyUtils.regFilter).flatMap(_._2).map(_.value).toList,
+            "device_type" -> Seq(ResourceString("memory")),
+            "status"      -> Seq(ResourceString("okay"))
+          ))
+        }
+      }
+      (0 until banks).map { b =>
+        val bank = LazyModule(new testchipip.soc.ScratchpadBankNonClockDiplomatic(
+            subbanks,
+            AddressSet(base + bankStripe * b, size - 1 - mask),
+            busBeatBytes,
+            device,
+            BufferParams.default))
+        bank.xbar := TLBuffer(BufferParams.default) := spad_xbar.node
+      }
+
+      // let outer memory come to scratchpad
+      spad_xbar.node := TLBuffer() := TLWidthWidget(busBeatBytes) := stlNode
+      // allow mem. reqs. to go to spad w/o going out to sbus
+      spad_xbar.node := TLWidthWidget(busBeatBytes) := xbar.node
+
+      TLFilter(TLFilter.mSubtract(Seq(AddressSet(base, size-1))))
+    }
+    case None => TLIdentityNode()
+  }
+
+  // let acc mem. reqs come be sent out (filter out all from spad)
+  atlNode := intNode := TLWidthWidget(busBeatBytes) := xbar.node
 }
 
 class ProtoAccelSerializerImp(outer: ProtoAccelSerializer, totalSerFieldHandlers: Int)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
