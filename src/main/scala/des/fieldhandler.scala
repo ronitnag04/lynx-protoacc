@@ -87,13 +87,13 @@ class FieldHandler()(implicit p: Parameters) extends Module {
       stacks_index := 0.U
       processed_len_total := 0.U
     } .otherwise {
-
       val next_processed_len_total = processed_len_total + io.consumer.user_consumed_bytes
       when (next_processed_len_total === current_len) {
         ProtoaccLogger.logInfo("NStack: Removing an entry.\n")
         stacks_index := stacks_index - 1.U
       }
       processed_len_total := next_processed_len_total
+      ProtoaccLogger.logInfo("Updating processed_len_total: %d <- %d\n", processed_len_total, next_processed_len_total)
     }
   }
 
@@ -536,22 +536,22 @@ class FieldHandler()(implicit p: Parameters) extends Module {
             io.consumer.output_ready := io.fixed_writer_request.ready
             io.fixed_writer_request.valid := io.consumer.output_valid
             io.consumer.user_consumed_bytes := varintlen
-          }
 
-          when (io.consumer.output_valid && io.fixed_writer_request.ready && nested_message) {
-            when (descr_resp_reg.is_repeated) {
-              urc_next_write_addr := urc_next_write_addr + (1.U(64.W) << io.fixed_writer_request.bits.write_width)
-              urc_elems_written := urc_elems_written + 1.U
+            when (io.consumer.output_valid && io.fixed_writer_request.ready) {
+              ProtoaccLogger.logInfo("NESTED MESSAGE. s1. is_repeated: %d, type: %d, ptr_waddr: 0x%x, ptr_value: 0x%x, packedfieldlen: %d bytes\n",
+                is_repeated, type_info, io.fixed_writer_request.bits.write_addr,
+                fixed_alloc_region_next, varintresult)
+
+              when (descr_resp_reg.is_repeated) {
+                urc_next_write_addr := urc_next_write_addr + (1.U(64.W) << io.fixed_writer_request.bits.write_width)
+                urc_elems_written := urc_elems_written + 1.U
+              }
+
+              nestedobj_encodedlen := varintresult
+              switchNestedMessageSetupState := sGetDescrTableAddr
+
+              newobjwriteaddr := fixed_alloc_region_next
             }
-
-            ProtoaccLogger.logInfo("NESTED MESSAGE. s1. is_repeated: %d, type: %d, ptr_waddr: 0x%x, ptr_value: 0x%x, packedfieldlen: %d bytes\n",
-              is_repeated, type_info, io.fixed_writer_request.bits.write_addr,
-              fixed_alloc_region_next, varintresult)
-
-            nestedobj_encodedlen := varintresult
-            switchNestedMessageSetupState := sGetDescrTableAddr
-
-            newobjwriteaddr := fixed_alloc_region_next
           }
         }
 
@@ -591,28 +591,38 @@ class FieldHandler()(implicit p: Parameters) extends Module {
               fieldState := sReadKey
             }
 
-            val min_max_field_nos = descriptor_table_handler.io.extra_meta_response.bits.extra_meta1
-            val obtained_hasbits_offset = descriptor_table_handler.io.extra_meta_response.bits.extra_meta0
-            val min_field_no = min_max_field_nos >> 32
-            val max_field_no = min_max_field_nos(31, 0)
-            ProtoaccLogger.logInfo("MinFieldNo: %d, MaxFieldNo: %d", min_field_no, max_field_no)
+            // skip adding to the stack if len is 0 (i.e. empty message)
+            when (nestedobj_encodedlen =/= 0.U) {
+              val min_max_field_nos = descriptor_table_handler.io.extra_meta_response.bits.extra_meta1
+              val obtained_hasbits_offset = descriptor_table_handler.io.extra_meta_response.bits.extra_meta0
+              val min_field_no = min_max_field_nos >> 32
+              val max_field_no = min_max_field_nos(31, 0)
+              ProtoaccLogger.logInfo("MinFieldNo: %d, MaxFieldNo: %d HasBitsOff: %d NewObjWAddr: 0x%x DescAddr: 0x%x\n", min_field_no, max_field_no, obtained_hasbits_offset, newobjwriteaddr, newobj_descriptor)
 
-            val compare_encoded_lens = processed_len_total + nestedobj_encodedlen
-            when (compare_encoded_lens === current_len) {
-              ProtoaccLogger.logInfo("NStack: Replacing top entry\n")
-              out_addr_stack(stacks_index) := newobjwriteaddr
-              hasbits_offset_stack(stacks_index) := obtained_hasbits_offset
-              descr_table_stack(stacks_index) := newobj_descriptor
-              min_field_no_stack(stacks_index) := min_field_no
+              val compare_encoded_lens = processed_len_total + nestedobj_encodedlen
+
+              // current_len is the amount of data to work on for a particular message (i.e. a message has 36B then curr_len is 36B)(or something like that)
+              ProtoaccLogger.logInfo("Compare:%d v.s. Curr:%d\n", compare_encoded_lens, current_len)
+              when (compare_encoded_lens === current_len) {
+                ProtoaccLogger.logInfo("NStack: Replacing top entry: %d\n", stacks_index)
+                out_addr_stack(stacks_index) := newobjwriteaddr
+                hasbits_offset_stack(stacks_index) := obtained_hasbits_offset
+                descr_table_stack(stacks_index) := newobj_descriptor
+                min_field_no_stack(stacks_index) := min_field_no
+              } .otherwise {
+                ProtoaccLogger.logInfo("NStack: Adding entry: %d\n", stacks_index)
+                val next_stack_ind = stacks_index + 1.U
+
+                out_addr_stack(next_stack_ind) := newobjwriteaddr
+                hasbits_offset_stack(next_stack_ind) := obtained_hasbits_offset
+                descr_table_stack(next_stack_ind) := newobj_descriptor
+                min_field_no_stack(next_stack_ind) := min_field_no
+
+                lens_table_stack(next_stack_ind) := compare_encoded_lens
+                stacks_index := next_stack_ind
+              }
             } .otherwise {
-              ProtoaccLogger.logInfo("NStack: Adding entry\n")
-              val next_stack_ind = stacks_index + 1.U
-              out_addr_stack(next_stack_ind) := newobjwriteaddr
-              hasbits_offset_stack(next_stack_ind) := obtained_hasbits_offset
-              descr_table_stack(next_stack_ind) := newobj_descriptor
-              lens_table_stack(next_stack_ind) := compare_encoded_lens
-              min_field_no_stack(next_stack_ind) := min_field_no
-              stacks_index := next_stack_ind
+              ProtoaccLogger.logInfo("Skipping stack manipulation due to empty message\n")
             }
           }
         }

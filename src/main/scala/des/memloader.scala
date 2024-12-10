@@ -186,11 +186,11 @@ class MemLoader()(implicit p: Parameters) extends Module
     mem_resp_queues(queueno).enq.valid := resp_fire_noqueues.fire() && use_this_queue && all_queues_ready
   }
 
-  for ( queueno <- 0 until NUM_QUEUES ) {
-    when (mem_resp_queues(queueno).deq.valid) {
-      ProtoaccLogger.logInfo("queueind %d, val %x\n", queueno.U, mem_resp_queues(queueno).deq.bits)
-    }
-  }
+  // for ( queueno <- 0 until NUM_QUEUES ) {
+  //   when (mem_resp_queues(queueno).deq.valid) {
+  //     ProtoaccLogger.logInfo("queueind %d, val %x\n", queueno.U, mem_resp_queues(queueno).deq.bits)
+  //   }
+  // }
 
 
 

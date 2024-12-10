@@ -182,11 +182,11 @@ class SerMemwriter()(implicit p: Parameters) extends Module
     mem_resp_queues(queueno).enq.valid := input_fire_allqueues.fire() && use_this_queue && !end_of_toplevel
   }
 
-  for ( queueno <- 0 until NUM_QUEUES ) {
-    when (mem_resp_queues(queueno).deq.valid) {
-      ProtoaccLogger.logInfo("qi%d,0x%x\n", queueno.U, mem_resp_queues(queueno).deq.bits)
-    }
-  }
+  // for ( queueno <- 0 until NUM_QUEUES ) {
+  //   when (mem_resp_queues(queueno).deq.valid) {
+  //     ProtoaccLogger.logInfo("qi%d,0x%x\n", queueno.U, mem_resp_queues(queueno).deq.bits)
+  //   }
+  // }
 
 
 

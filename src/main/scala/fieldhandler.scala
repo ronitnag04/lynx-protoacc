@@ -29,7 +29,7 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
   })
 
   // logger config
-  implicit val prefix = logPrefix
+  implicit val prefix: String = logPrefix
 
   val outputQ = Module(new Queue(new WriterBundle, 4))
   io.writer_output <> outputQ.io.deq
@@ -63,10 +63,12 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
   val cpp_size_nonlog2_numbits_fromreg = cpp_size_nonlog2_fromreg << 3
   val wire_type_reg = RegInit(0.U(log2Up(5).W))
   val detailedTypeIsPotentiallyScalar_reg = RegInit(false.B)
+  val rep_size = RegInit(0.U(64.W))
 
   val src_data_addr_reg = RegInit(0.U(64.W))
 
-  val unencoded_key = Cat(io.ops_in.bits.field_number, wire_type(2, 0))
+  // default to packed for primitive repeated fields
+  val unencoded_key = Cat(io.ops_in.bits.field_number, Mux(is_repeated && detailedTypeIsPotentiallyScalar, WIRE_TYPES.WIRE_TYPE_LEN_DELIM(2, 0), wire_type(2, 0)))
   val key_encoder = Module(new CombinationalVarintEncode)
   key_encoder.io.inputData := unencoded_key
   val encoded_key_reg = Reg(UInt())
@@ -80,6 +82,8 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
   val read_mask = Wire(UInt(128.W))
   read_mask := ((1.U << (cpp_size_nonlog2_numbits_fromreg)) - 1.U)
 
+  val size_encoder = Module(new CombinationalVarintEncode)
+  size_encoder.io.inputData := rep_size
 
   val ORMASK = ((1.U(128.W) << 32) - 1.U) << 32
   val mem_resp_masked = io.memread.resp.bits.data & read_mask
@@ -125,6 +129,7 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
   val S_SCALAR_DISPATCH_REQ = 1.U
   val S_SCALAR_OUTPUT_DATA = 2.U
   val S_WRITE_KEY = 3.U
+  val S_REPSIZE_B4_WRITE_KEY = 15.U
 
   val S_STRING_GETPTR = 4.U
   val S_STRING_GETHEADER1 = 5.U
@@ -177,24 +182,21 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
         cpp_size_log2_reg := cpp_size_log2
         is_varint_signed_reg := is_varint_signed
         is_int32_reg := is_int32
-        detailedTypeIsPotentiallyScalar_reg := detailedTypeIsPotentiallyScalar
 
         encoded_key_reg := key_encoder.io.outputData
         encoded_key_bytes_reg := key_encoder.io.outputBytes
 
         src_data_addr_reg := io.ops_in.bits.src_data_addr
 
-        // Invalid for some reason:
-        // ProtoaccLogger.logInfo("S_WAIT_CMD: accept op: src_data_addr 0x%x, src_data_type %d, is_repeated 0x%x, field_number %d, wire_type %d, cpp_size_log2 %d, is_varint_signed %d\n",
-        //   Wire(io.ops_in.bits.src_data_addr),
-        //   Wire(io.ops_in.bits.src_data_type),
-        //   Wire(is_repeated),
-        //   Wire(io.ops_in.bits.field_number),
-        //   Wire(wire_type),
-        //   Wire(cpp_size_log2),
-        //   Wire(is_varint_signed)
-        // )
-
+        ProtoaccLogger.logInfo("S_WAIT_CMD: accept op: src_data_addr 0x%x, src_data_type %d, is_repeated 0x%x, field_number %d, wire_type %d, cpp_size_log2 %d, is_varint_signed %d\n",
+          io.ops_in.bits.src_data_addr,
+          io.ops_in.bits.src_data_type,
+          is_repeated,
+          io.ops_in.bits.field_number,
+          wire_type,
+          cpp_size_log2,
+          is_varint_signed
+        )
 
         when (detailedTypeIsPotentiallyScalar && !is_repeated) {
           ProtoaccLogger.logInfo("S_WAIT_CMD: moving to handle scalar\n")
@@ -254,15 +256,13 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
           ProtoaccLogger.logInfo("S_SCALAR_OUTPUT_DATA: nonrepeated or unpacked repeated\n")
           handlerState := S_WRITE_KEY
         } .otherwise {
+          rep_size := rep_size + outputQ.io.enq.bits.validbytes
           when (src_data_addr_reg === repeated_elems_headptr) {
             ProtoaccLogger.logInfo("S_SCALAR_OUTPUT_DATA: packed repeated lastelem\n")
-
-            repeated_elems_headptr := 0.U
-            handlerState := S_WRITE_KEY
+            handlerState := S_REPSIZE_B4_WRITE_KEY
           } .otherwise {
             val nextptr = src_data_addr_reg - cpp_size_nonlog2_fromreg
-            ProtoaccLogger.logInfo("S_SCALAR_OUTPUT_DATA: packed repeated continue, nextptr: 0x%x\n",
-              nextptr)
+            ProtoaccLogger.logInfo("S_SCALAR_OUTPUT_DATA: packed repeated continue, nextptr: 0x%x\n", nextptr)
             src_data_addr_reg := nextptr
             handlerState := S_SCALAR_DISPATCH_REQ
           }
@@ -270,18 +270,34 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
       }
     }
 
-    is (S_WRITE_KEY) {
-      ProtoaccLogger.logInfo("S_WRITE_KEY\n")
+    // HACK: if here, then you need to write the size of the packed repeated field before going to S_WRITE_KEY
+    is (S_REPSIZE_B4_WRITE_KEY) {
+      outputQ.io.enq.valid := true.B
 
+      // unsure if this covers maximal size of encoding (since only writing 2B)
+      outputQ.io.enq.bits.data := size_encoder.io.outputData
+      outputQ.io.enq.bits.validbytes := size_encoder.io.outputBytes
+      outputQ.io.enq.bits.last_for_arbitration_round := false.B
+      outputQ.io.enq.bits.depth := io.ops_in.bits.depth
+      outputQ.io.enq.bits.end_of_message := false.B
+
+      when (outputQ.io.enq.ready) {
+        ProtoaccLogger.logInfo("S_REPSIZE_B4_WRITE_KEY: size:%d encodedas: 0x%x (validbytes:%d)\n", rep_size, size_encoder.io.outputData, size_encoder.io.outputBytes)
+        handlerState := S_WRITE_KEY
+      }
+    }
+
+    is (S_WRITE_KEY) {
+      ProtoaccLogger.logInfo("S_WRITE_KEY: encoded_key 0x%x, encoded_key_bytes 0x%x\n",
+        encoded_key_reg,
+        encoded_key_bytes_reg)
 
       outputQ.io.enq.bits.data := encoded_key_reg
       outputQ.io.enq.bits.validbytes := encoded_key_bytes_reg
       outputQ.io.enq.bits.depth := io.ops_in.bits.depth
       outputQ.io.enq.bits.end_of_message := io.ops_in.bits.end_of_message
 
-
       outputQ.io.enq.valid := true.B
-
 
       when (outputQ.io.enq.ready) {
         when (!is_repeated) {
@@ -562,7 +578,7 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
 
     // Following states read the Repeated{Ptr}Field object (with different internal elements)
     is (S_UNPACKED_REP_GETPTR) {
-      ProtoaccLogger.logInfo("S_UNPACKED_REP_GETPTR: req ptr to unpacked elems\n")
+      ProtoaccLogger.logInfo("S_UNPACKED_REP_GETPTR: req ptr to unpacked elems: is_bytes_or_string:%d\n", is_bytes_or_string)
 
       io.memread.req.valid := true.B
 
@@ -638,6 +654,8 @@ class SerFieldHandler(logPrefix: String)(implicit p: Parameters) extends Module
         ProtoaccLogger.logInfo("S_UNPACKED_REP_RECVSIZE: recv size of unpacked. got size (elems) %d, ptr to last elem is 0x%x\n",
           num_elems,
           ptr_to_last_elem)
+
+        rep_size := 0.U
 
         src_data_addr_reg := ptr_to_last_elem
         when (is_bytes_or_string) {
