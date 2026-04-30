@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+*.o
+*.riscv
+*.dump
+
+# Runtime / debug
+*.log
+*.out
+*.vcd
+*.fst
+
+# Editor / temp
+*.swp
+*~
+.DS_Store
