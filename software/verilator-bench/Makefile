@@ -14,7 +14,8 @@ CFLAGS  := -march=$(ARCH) -mabi=$(ABI) \
            -std=gnu99 -O2 -Wall -Wno-unused-variable \
            -fno-common -fno-builtin-printf \
            -DACCEL_REGION_DEFAULT_SHIFT=13 -DACCEL_REGION_SER_SHIFT=13 \
-           -specs=htif_nano.specs
+           -specs=htif_nano.specs \
+           -I. -Igen
 
 LDFLAGS := -static -specs=htif_nano.specs
 
@@ -22,15 +23,18 @@ COMMON_SRCS := accel_rocc.c
 COMMON_OBJS := $(addprefix $(BUILD)/,$(COMMON_SRCS:.c=.o))
 HEADERS     := accel_rocc.h rocc.h bench_common.h
 
-BENCHES := bench_tiny_ser bench_tiny_des
-ELFS    := $(addprefix $(BUILD)/,$(addsuffix .riscv,$(BENCHES)))
+TINY_BENCHES := bench_tiny_ser bench_tiny_des
+HPB_BENCHES  := bench0_ser bench1_ser bench2_ser bench3_ser bench4_ser bench5_ser
+BENCHES      := $(TINY_BENCHES) $(HPB_BENCHES)
+ELFS         := $(addprefix $(BUILD)/,$(addsuffix .riscv,$(BENCHES)))
 
-.PHONY: all clean
+.PHONY: all clean gen
 all: $(ELFS)
 
-$(BUILD):
+$(BUILD) $(BUILD)/gen:
 	mkdir -p $@
 
+# Tiny benches
 $(BUILD)/%.o: %.c $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -39,6 +43,29 @@ $(BUILD)/bench_tiny_ser.riscv: $(BUILD)/bench_tiny_ser.o $(COMMON_OBJS) | $(BUIL
 
 $(BUILD)/bench_tiny_des.riscv: $(BUILD)/bench_tiny_des.o $(COMMON_OBJS) | $(BUILD)
 	$(CC) $(LDFLAGS) $^ -o $@
+
+# HyperProtoBench serializer benches. For each bench<N>_ser we compile
+# bench_hpb_ser.c with -DBENCH_NAME / -DBENCH_DESCRIPTORS_H selecting the
+# generated header, plus the generated data.c providing the instance bytes.
+$(BUILD)/gen/bench%_data.o: gen/bench%_data.c gen/bench%_descriptors.h | $(BUILD)/gen
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/bench%_ser.o: bench_hpb_ser.c gen/bench%_descriptors.h $(HEADERS) | $(BUILD)
+	$(CC) $(CFLAGS) -DBENCH_NAME=\"bench$*\" \
+	      -DBENCH_DESCRIPTORS_H=\"bench$*_descriptors.h\" \
+	      -c $< -o $@
+
+$(BUILD)/bench%_ser.riscv: $(BUILD)/bench%_ser.o $(BUILD)/gen/bench%_data.o $(COMMON_OBJS) | $(BUILD)
+	$(CC) $(LDFLAGS) $^ -o $@
+
+# Regenerate descriptor + data files from .proto sources.
+HPB_DIR ?= /home/ec2-user/lynx/HyperProtoBench
+gen: $(foreach b,0 1 2 3 4 5,gen/bench$(b)_descriptors.h gen/bench$(b)_data.c)
+
+gen/bench%_descriptors.h gen/bench%_data.c: $(HPB_DIR)/bench%/benchmark.proto gen/proto_to_accel.py
+	python3 gen/proto_to_accel.py --proto $< \
+	  --out-header gen/bench$*_descriptors.h \
+	  --out-source gen/bench$*_data.c
 
 clean:
 	rm -rf $(BUILD)

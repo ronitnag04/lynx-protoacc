@@ -4,6 +4,13 @@ build/
 *.riscv
 *.dump
 
+# Generator output (regenerate with `make gen`)
+gen/bench*_data.c
+gen/bench*_descriptors.h
+
+# Benchmark results (regenerate with `parse_results.py`)
+benchmark_results.json
+
 # Runtime / debug
 *.log
 *.out
@@ -14,3 +21,4 @@ build/
 *.swp
 *~
 .DS_Store
+__pycache__/
