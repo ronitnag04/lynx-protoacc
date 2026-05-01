@@ -65,17 +65,40 @@ targets a different rate.
 |-----------------------|--------|-------|
 | `bench_tiny_ser.riscv`| WORKS  | Hand-crafted `{int32, string}`, produces correct 9-byte wire output |
 | `bench_tiny_des.riscv`| WORKS  | Hand-crafted deser, reconstructs `f1=42 f2="hello"` |
-| `bench[0-5]_ser.riscv`| WORKS  | 1 field per top-level message (`KEEP_FIRST_FIELD_ONLY=True`). All 6 benches serialize 40 messages each and exit with Verilog $finish. Throughput 31-45 MB/s at 1 GHz. |
+| `bench[0-5]_ser.riscv`| WORKS  | Full multi-field with primitives, strings/bytes, and nested submessages (up to 3 levels deep). All 6 HyperProtoBench schemas exercised end-to-end. At 1 GHz: bench0=454, bench1=319, bench2=278, bench3=308, bench4=323, bench5=268 MB/s. |
+| `bench_repro_c*.riscv` | Debug | Minimal reproducers used during bug bisection. Cases 11/13/14 still deliberately fail (they demonstrate the packed-buffer string bug). |
+| `bench_isolate_bN_mI.riscv` | Debug | Per-message isolator that compiles ONE top-level message from generated bench data. Useful for bisecting which specific message breaks when regressions appear. |
 
-### Known limitation
+### Design notes
 
-With `KEEP_FIRST_FIELD_ONLY=False` (multi-field per message), the serializer trips
-a TileLink monitor assertion `'A' channel carries Get type which slave claims it
-can't support` at `protoacc_serializer.scala:39` (the 3rd `mem_serfieldhandler`).
-The bug appears only when the `FieldDispatchRouter` dispatches work to more than
-one parallel handler. Single-field runs stay on handler #0 and succeed. Needs
-RTL-level inspection with `ProtoAccelRocketDebugConfig` and a cycle-by-cycle
-VCD trace.
+Per top-level message M the generator emits four separate static arrays, plus
+small spec tables the runtime walks to stitch them together:
+
+```
+M_INSTANCE[obj_size]             # top cpp_obj (primitives + zero slots)
+M_NESTED_POOL[nested_bytes]      # concat of nested cpp_objs, 16-B aligned
+M_STRING_HEADERS[K*32]           # K ArenaStringPtr {char*, size_t} blocks, 32-B aligned
+M_STRING_PAYLOADS[payload_bytes] # concat of all string payloads, 16-B aligned + cushion
+M_NESTED_SPECS[N*3]              # {parent_instance, parent_slot_offset, nested_offset}
+M_STRING_SPECS[K*5]              # {owner_instance, slot_offset, hdr_idx, payload_offset, length}
+```
+
+At runtime, `fixup_nested()` + `fixup_strings()` walk the spec tables and patch:
+- parent cpp_obj slot for each nested submessage → absolute address of the nested
+  instance in `NESTED_POOL`
+- parent cpp_obj slot for each string → `((uint64_t)&STRING_HEADERS[i]) | 0x3`
+- `STRING_HEADERS[i].data = &STRING_PAYLOADS[p]; .length = L`
+
+Why three pools (not one): packing strings or nested instances inside the top
+cpp_obj buffer triggers a hardware fault in the ProtoAcc serializer (see
+`project_hpb_ser_multifield_bug.md` memory note for the reproducers). Keeping
+them in distinct static arrays at distinct `.data` addresses avoids the bug.
+
+- **Submessages**: supported. Nested cpp_objs are pre-allocated recursively up
+  to `MAX_NESTED_DEPTH=3`. Each nested instance gets its own primitives and
+  possibly further nested children.
+- **Repeated / map / oneof / groups**: skipped; the generator emits a zero
+  placeholder entry and doesn't set the presence bit.
 
 ## Layout
 

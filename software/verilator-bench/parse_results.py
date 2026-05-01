@@ -64,6 +64,12 @@ def main():
     )
     ap.add_argument("--clock-hz", type=float, default=1e9)
     ap.add_argument("--output", type=Path, default=Path("benchmark_results.json"))
+    ap.add_argument(
+        "--include-dev",
+        action="store_true",
+        help="Include dev/reproducer benches (tiny_*, repro) in the output. "
+             "Default: only the HPB bench0..bench5 entries.",
+    )
     args = ap.parse_args()
 
     if not args.log_dir.is_dir():
@@ -88,6 +94,8 @@ def main():
         op_key = {"ser": "serializer", "des": "deserializer"}.get(op)
         if op_key is None:
             print(f"[skip] {path.name}: unknown op={op}", file=sys.stderr)
+            continue
+        if not args.include_dev and not bench.startswith("bench"):
             continue
         cycles = summary["cycles"]
         bytes_ = summary["bytes"]

@@ -41,30 +41,46 @@ void AccelSetup(void) {
            (void *)fixed_u, (void *)array_u, (uint64_t)sizeof(accel_fixed_region));
 }
 
+// Serializer output regions use static BSS so we don't pound the small
+// htif_nano malloc heap. Sized to absorb HPB-realistic payloads: 10 top-level
+// messages × (ITERS+1) iters × up to a few KB each.
+#ifndef ACCEL_SER_DATA_BYTES
+#define ACCEL_SER_DATA_BYTES  (512 * 1024)
+#endif
+#ifndef ACCEL_SER_PTR_COUNT
+#define ACCEL_SER_PTR_COUNT   512
+#endif
+
+static __attribute__((aligned(4096))) char accel_ser_data_region[ACCEL_SER_DATA_BYTES];
+static __attribute__((aligned(4096))) char *accel_ser_ptr_region[ACCEL_SER_PTR_COUNT];
+
 volatile char **AccelSetupAllocRegionSerializer(size_t num_string_pointers,
                                                 size_t total_string_data_bytes) {
     ROCC_INSTRUCTION(PROTOACC_SER_OPCODE, FUNCT_SER_SFENCE);
 
-    size_t data_sz = ((total_string_data_bytes + 63) / 64) * 64;
-    char *data_region = (char *)memalign(PAGESIZE_BYTES, data_sz);
-    touch_all_pages(data_region, data_sz);
+    if (num_string_pointers > ACCEL_SER_PTR_COUNT) {
+        printf("AccelSetupSer: FATAL: need %lu ptrs, have %d\n",
+               (uint64_t)num_string_pointers, ACCEL_SER_PTR_COUNT);
+        return NULL;
+    }
+    if (total_string_data_bytes > ACCEL_SER_DATA_BYTES) {
+        printf("AccelSetupSer: FATAL: need %lu data bytes, have %d\n",
+               (uint64_t)total_string_data_bytes, ACCEL_SER_DATA_BYTES);
+        return NULL;
+    }
 
-    uint64_t data_base = (uint64_t)data_region;
-    uint64_t data_tail = data_base + (uint64_t)data_sz;
+    touch_all_pages(accel_ser_data_region, ACCEL_SER_DATA_BYTES);
+    touch_all_pages((char *)accel_ser_ptr_region, sizeof(accel_ser_ptr_region));
 
-    size_t ptr_sz = num_string_pointers * sizeof(char *);
-    char **ptr_region = (char **)memalign(PAGESIZE_BYTES, ptr_sz);
-    touch_all_pages((char *)ptr_region, ptr_sz);
+    uint64_t data_tail = (uint64_t)(uintptr_t)accel_ser_data_region + ACCEL_SER_DATA_BYTES;
+    accel_ser_ptr_region[0] = (char *)data_tail;
+    char **ret_ptrs = accel_ser_ptr_region + 1;
 
-    // Initialize ptrs[0] to the tail, then return &ptrs[1] so ptrs[index>=0] receives outputs
-    // (see baremetal/accellib.c:82-83 for the same convention).
-    ptr_region[0] = (char *)data_tail;
-    ptr_region += 1;
-
-    uint64_t ptr_u = (uint64_t)ptr_region;
+    uint64_t ptr_u = (uint64_t)(uintptr_t)ret_ptrs;
     ROCC_INSTRUCTION_SS(PROTOACC_SER_OPCODE, data_tail, ptr_u, FUNCT_SER_MEM_SETUP);
-    printf("AccelSetupSer: data_tail=%p ptr=%p\n", (void *)data_tail, (void *)ptr_u);
-    return (volatile char **)ptr_region;
+    printf("AccelSetupSer: data_tail=%p ptr=%p bytes=%d\n",
+           (void *)data_tail, (void *)ptr_u, ACCEL_SER_DATA_BYTES);
+    return (volatile char **)ret_ptrs;
 }
 
 void AccelSerializeToString_Helper(const void *descriptor_table_ptr,
