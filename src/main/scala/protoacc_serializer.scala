@@ -20,9 +20,10 @@ import testchipip.soc.{BankedScratchpadParams}
 
 import protoacc.ser._
 
-// note: reduce totalSerFieldHandlers to reduce printfs to synthesize for firesim
-class ProtoAccelSerializer(opcodes: OpcodeSet, spadParams: Option[BankedScratchpadParams] = None, totalSerFieldHandlers: Int = 6)(implicit p: Parameters) extends LazyRoCC(
-    opcodes = opcodes, nPTWPorts = 3 + totalSerFieldHandlers) {
+// note: reduce ProtoAccelSerFieldHandlers (p) to reduce printfs to synthesize for firesim
+class ProtoAccelSerializer(opcodes: OpcodeSet, spadParams: Option[BankedScratchpadParams] = None)(implicit p: Parameters) extends LazyRoCC(
+    opcodes = opcodes, nPTWPorts = 3 + p(ProtoAccelSerFieldHandlers)) {
+  val totalSerFieldHandlers: Int = p(ProtoAccelSerFieldHandlers)
   override lazy val module = new ProtoAccelSerializerImp(this, totalSerFieldHandlers)
   //chisel3.experimental.annotate(midas.targetutils.EnableModelMultiThreadingAnnotation(module))
 

@@ -206,19 +206,19 @@ class DescriptorTableHandler()(implicit p: Parameters) extends Module
     val l1helperUser = new L1MemHelperBundle
   })
 
-  val l1reqQueue = Module(new Queue(new L1ReqInternal, 4))
+  val l1reqQueue = Module(new Queue(new L1ReqInternal, p(ProtoAccelDesDthL1Reqs)))
   io.l1helperUser.req <> l1reqQueue.io.deq
 
-  val FDR_queue = Module(new Queue(new DescriptorRequest, 4))
+  val FDR_queue = Module(new Queue(new DescriptorRequest, p(ProtoAccelDesDthFdReqs)))
   FDR_queue.io.enq <> io.field_dest_request
 
 
   l1reqQueue.io.enq.bits.cmd := M_XRD
 
-  val fieldDestResponseQueue = Module(new Queue(new DescriptorResponse, 4))
+  val fieldDestResponseQueue = Module(new Queue(new DescriptorResponse, p(ProtoAccelDesDthFdResps)))
   io.field_dest_response <> fieldDestResponseQueue.io.deq
 
-  val extraMetaResponseQueue = Module(new Queue(new ExtraMetaResponse, 4))
+  val extraMetaResponseQueue = Module(new Queue(new ExtraMetaResponse, p(ProtoAccelDesDthFdResps)))
   io.extra_meta_response <> extraMetaResponseQueue.io.deq
 
   fieldDestResponseQueue.io.enq.bits.proto_addr := FDR_queue.io.deq.bits.proto_addr

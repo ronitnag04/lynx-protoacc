@@ -51,8 +51,8 @@ class CommandRouter()(implicit p: Parameters) extends Module {
   io.dmem_status_out.bits <> io.rocc_in.bits
   io.dmem_status_out.valid := io.rocc_in.fire
 
-  val proto_parse_info_out_queue = Module(new Queue(new RoCCCommand, 2))
-  val do_proto_parse_out_queue = Module(new Queue(new RoCCCommand, 2))
+  val proto_parse_info_out_queue = Module(new Queue(new RoCCCommand, p(ProtoAccelDesCrRoccCommands)))
+  val do_proto_parse_out_queue = Module(new Queue(new RoCCCommand, p(ProtoAccelDesCrRoccCommands)))
 
   io.proto_parse_info_out <> proto_parse_info_out_queue.io.deq
   io.do_proto_parse_out <> do_proto_parse_out_queue.io.deq

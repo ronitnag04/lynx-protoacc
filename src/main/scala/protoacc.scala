@@ -28,9 +28,9 @@ class ProtoAccel(opcodes: OpcodeSet, spadParams: Option[BankedScratchpadParams] 
   val xbar = LazyModule(new TLXbar)
 
   // acc. memory accessors
-  val mem_descr = LazyModule(new L1MemHelper("[m_descr]", numOutstandingReqs=4))
+  val mem_descr = LazyModule(new L1MemHelper("[m_descr]", numOutstandingReqs=p(ProtoAccelDesTopDescriptorReqs)))
   xbar.node := TLBuffer.chainNode(1) := mem_descr.masterNode
-  val mem_memloader = LazyModule(new L1MemHelper("[m_memloader]", numOutstandingReqs=64, queueResponses=true))
+  val mem_memloader = LazyModule(new L1MemHelper("[m_memloader]", numOutstandingReqs=p(ProtoAccelDesTopMemloaderReqs), queueResponses=true))
   xbar.node := TLBuffer.chainNode(1) := mem_memloader.masterNode
   val mem_hasbits = LazyModule(new L1MemHelper(printInfo="[m_hasbits]", queueRequests=true))
   xbar.node := TLBuffer.chainNode(1) := mem_hasbits.masterNode

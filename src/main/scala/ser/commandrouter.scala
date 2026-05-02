@@ -51,8 +51,8 @@ class CommandRouterSerializer()(implicit p: Parameters) extends Module {
   io.dmem_status_out.bits <> io.rocc_in.bits
   io.dmem_status_out.valid := io.rocc_in.fire
 
-  val hasbits_setup_info_out_queue = Module(new Queue(new RoCCCommand, 2))
-  val do_proto_serialize_out_queue = Module(new Queue(new RoCCCommand, 2))
+  val hasbits_setup_info_out_queue = Module(new Queue(new RoCCCommand, p(ProtoAccelSerCrRoccCommands)))
+  val do_proto_serialize_out_queue = Module(new Queue(new RoCCCommand, p(ProtoAccelSerCrRoccCommands)))
 
 
   val ser_out_fire = DecoupledHelper(

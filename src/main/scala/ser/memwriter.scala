@@ -27,10 +27,10 @@ class SerMemwriter()(implicit p: Parameters) extends Module
     val mem_work_outstanding = Output(Bool())
   })
 
-  val writes_input_IF_Q = Module(new Queue(new WriterBundle, 4))
+  val writes_input_IF_Q = Module(new Queue(new WriterBundle, p(ProtoAccelSerMwWriteInput)))
   writes_input_IF_Q.io.enq <> io.memwrites_in
 
-  val write_inject_Q = Module(new Queue(new WriterBundle, 4))
+  val write_inject_Q = Module(new Queue(new WriterBundle, p(ProtoAccelSerMwWriteInject)))
 
   val depth = RegInit(0.U(ProtoaccParams.MAX_NESTED_LEVELS_WIDTH.W))
 
@@ -110,7 +110,7 @@ class SerMemwriter()(implicit p: Parameters) extends Module
   }
 
 
-  val write_ptrs_Q = Module(new Queue(UInt(64.W), 10))
+  val write_ptrs_Q = Module(new Queue(UInt(64.W), p(ProtoAccelSerMwWritePtrs)))
   when (write_ptrs_Q.io.enq.fire) {
     ProtoaccLogger.logInfo("[memwriter-serializer] enqueued ptr: 0x%x\n", write_ptrs_Q.io.enq.bits)
   }

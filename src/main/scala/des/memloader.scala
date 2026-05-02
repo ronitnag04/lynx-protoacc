@@ -52,9 +52,9 @@ class MemLoader()(implicit p: Parameters) extends Module
     io.proto_parse_info_cmd.valid),
     "got do proto parse command without valid proto parse info command!\n")
 
-  val buf_info_queue = Module(new Queue(new BufInfoBundle, 16))
+  val buf_info_queue = Module(new Queue(new BufInfoBundle, p(ProtoAccelDesMlBufInfoQ)))
 
-  val load_info_queue = Module(new Queue(new LoadInfoBundle, 256))
+  val load_info_queue = Module(new Queue(new LoadInfoBundle, p(ProtoAccelDesMlLoadInfoQ)))
 
   val base_addr_bytes = io.do_proto_parse_cmd.bits.rs1
   val base_len = io.do_proto_parse_cmd.bits.rs2(31, 0)

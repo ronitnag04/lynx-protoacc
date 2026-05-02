@@ -139,7 +139,7 @@ class SerDescriptorTableHandler()(implicit p: Parameters) extends Module
 
   val hasbits_base_address = current_has_bits_base_offset_only + current_cpp_obj
   val is_submessage_base_address = current_is_submessage_base_addr
-  val hasbits_request_meta_Q = Module(new Queue(new HasBitsRequestMetaBundle, 4))
+  val hasbits_request_meta_Q = Module(new Queue(new HasBitsRequestMetaBundle, p(ProtoAccelSerDthHasbitsReqs)))
 
   hasbits_request_meta_Q.io.enq.valid := false.B
   io.l2helperUser1.req.valid := false.B
@@ -231,7 +231,7 @@ class SerDescriptorTableHandler()(implicit p: Parameters) extends Module
   val hasbits_resp_fieldno = hasbits_request_meta_Q.io.deq.bits.has_bits_max_bitoffset - fieldno_offset_from_tail
 
 
-  val descr_request_Q = Module(new Queue(new DescrRequestUopBundle, 4))
+  val descr_request_Q = Module(new Queue(new DescrRequestUopBundle, p(ProtoAccelSerDthDescriptorReqs)))
   descr_request_Q.io.enq.bits.descriptor_table_addr := hasbits_request_meta_Q.io.deq.bits.descriptor_table_addr
   descr_request_Q.io.enq.bits.cpp_obj_addr := hasbits_request_meta_Q.io.deq.bits.cpp_obj_addr
   descr_request_Q.io.enq.bits.relative_fieldno := hasbits_resp_fieldno
@@ -319,10 +319,10 @@ class SerDescriptorTableHandler()(implicit p: Parameters) extends Module
 
 
 
-  val regular_response_path = Module(new Queue(Bool(), 10))
+  val regular_response_path = Module(new Queue(Bool(), p(ProtoAccelSerDthRegResps)))
   regular_response_path.io.enq.bits := false.B
 
-  val descriptor_req_meta_Q = Module(new Queue(new DescrRequestUopBundle, 4))
+  val descriptor_req_meta_Q = Module(new Queue(new DescrRequestUopBundle, p(ProtoAccelSerDthReqsMeta)))
   descriptor_req_meta_Q.io.enq.bits := descr_request_Q.io.deq.bits
 
 
@@ -519,7 +519,7 @@ class SerDescriptorTableHandler()(implicit p: Parameters) extends Module
 
 
 
-  val serFieldHandlerOutput_Q = Module(new Queue(new DescrToHandlerBundle, 4))
+  val serFieldHandlerOutput_Q = Module(new Queue(new DescrToHandlerBundle, p(ProtoAccelSerDthFhOutputs)))
   io.ser_field_handler_output <> serFieldHandlerOutput_Q.io.deq
 
 

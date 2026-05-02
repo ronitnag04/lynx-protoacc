@@ -26,7 +26,7 @@ class FixedWriter()(implicit p: Parameters) extends Module
     val no_writes_inflight = Output(Bool())
   })
 
-  val l1reqQueue = Module(new Queue(new L1ReqInternal, 4))
+  val l1reqQueue = Module(new Queue(new L1ReqInternal, p(ProtoAccelDesFwL1Reqs)))
   io.l1helperUser.req <> l1reqQueue.io.deq
 
 
