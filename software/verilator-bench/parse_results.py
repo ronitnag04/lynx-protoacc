@@ -58,7 +58,7 @@ def main():
         type=Path,
         default=Path(
             "/home/ec2-user/hyperscale-grpc-chipyard/sims/verilator/output/"
-            "chipyard.harness.TestHarness.ProtoAccelRocketConfig"
+            "chipyard.harness.TestHarness.ProtoAccelRocketBaseConfig"
         ),
         help="Directory containing bench*_ser.log / bench*_des.log files.",
     )

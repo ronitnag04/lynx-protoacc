@@ -40,7 +40,7 @@ more small-payload messages that expose the fixed per-message dispatch overhead.
 ## What's implemented
 
 ### 1. Verilator sim config
-- `ProtoAccelRocketConfig` — direct-attach Rocket + 1 ProtoAcc serializer +
+- `ProtoAccelRocketBaseConfig` — direct-attach Rocket + 1 ProtoAcc serializer +
   1 ProtoAcc deserializer, no ReRoCC. Defined in
   [chipyard/src/main/scala/config/HyperscaleConfigs.scala](/home/ec2-user/hyperscale-grpc-chipyard/generators/chipyard/src/main/scala/config/HyperscaleConfigs.scala).
 - `ProtoAccelRocketDebugConfig` — same but with `WithProtoAccelPrintf` for
@@ -117,7 +117,7 @@ source /home/ec2-user/hyperscale-grpc-chipyard/env.sh
 
 # One-time: build the Verilator sim (~15 min on first build, cached after).
 cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
-make CONFIG=ProtoAccelRocketConfig -j$(nproc)
+make CONFIG=ProtoAccelRocketBaseConfig -j$(nproc)
 
 # Generate bench data + build ELFs.
 cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
@@ -126,7 +126,7 @@ make       # → build/bench<N>_ser.riscv
 
 # Run one bench (LOADMEM=1 bypasses TSI loader, saves ~2 min/run).
 cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
-BREAK_SIM_PREREQ=1 LOADMEM=1 make CONFIG=ProtoAccelRocketConfig run-binary-fast \
+BREAK_SIM_PREREQ=1 LOADMEM=1 make CONFIG=ProtoAccelRocketBaseConfig run-binary-fast \
     BINARY=/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/build/bench1_ser.riscv
 
 # Aggregate all bench logs → JSON matching Lynx's consumer schema.
@@ -134,7 +134,7 @@ cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilato
 python3 parse_results.py --output benchmark_results.json
 ```
 
-Output logs land in `sims/verilator/output/chipyard.harness.TestHarness.ProtoAccelRocketConfig/bench<N>_ser.log`.
+Output logs land in `sims/verilator/output/chipyard.harness.TestHarness.ProtoAccelRocketBaseConfig/bench<N>_ser.log`.
 
 ## Known bugs and gotchas
 

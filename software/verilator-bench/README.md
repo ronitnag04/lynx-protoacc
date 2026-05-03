@@ -10,12 +10,12 @@ deltas so the post-run parser can compute throughput.
 source /home/ec2-user/hyperscale-grpc-chipyard/env.sh
 ```
 
-A Verilator simulator for `ProtoAccelRocketConfig` must already exist at
-`sims/verilator/simulator-chipyard.harness-ProtoAccelRocketConfig`. Build it with:
+A Verilator simulator for `ProtoAccelRocketBaseConfig` must already exist at
+`sims/verilator/simulator-chipyard.harness-ProtoAccelRocketBaseConfig`. Build it with:
 
 ```bash
 cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
-make CONFIG=ProtoAccelRocketConfig -j$(nproc)
+make CONFIG=ProtoAccelRocketBaseConfig -j$(nproc)
 ```
 
 ## Build
@@ -32,11 +32,11 @@ make clean            # Remove build/
 cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
 
 # Fast path: LOADMEM=1 bypasses the TSI loader (saves ~2min/run on big ELFs)
-BREAK_SIM_PREREQ=1 LOADMEM=1 make CONFIG=ProtoAccelRocketConfig run-binary-fast \
+BREAK_SIM_PREREQ=1 LOADMEM=1 make CONFIG=ProtoAccelRocketBaseConfig run-binary-fast \
     BINARY=/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/build/bench_tiny_ser.riscv
 ```
 
-Output logs land under `sims/verilator/output/chipyard.harness.TestHarness.ProtoAccelRocketConfig/`.
+Output logs land under `sims/verilator/output/chipyard.harness.TestHarness.ProtoAccelRocketBaseConfig/`.
 
 ## Aggregate results
 
