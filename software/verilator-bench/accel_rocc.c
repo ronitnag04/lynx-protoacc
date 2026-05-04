@@ -17,11 +17,14 @@ static inline void touch_all_pages(char *region, size_t max_bytes) {
     }
 }
 
-// htif_nano has a tiny malloc heap; use static BSS regions instead so the first bench
-// (9-byte wire input) doesn't exhaust it. Sized for small benchmarks; grow via
-// ACCEL_STATIC_REGION_BYTES if ported to larger workloads.
+// htif_nano has a tiny malloc heap; use static BSS regions instead so the
+// deserializer has somewhere stable to dump output. The deserializer uses the
+// array region as a bump allocator within a single DO_PROTO_PARSE. The bench
+// driver re-issues MEM_SETUP between iterations to reset the bump pointer,
+// so we size for ONE max-sized message's dest workspace, not 40 iters. 64 KB
+// is comfortably above any single HPB top-level message's needs.
 #ifndef ACCEL_STATIC_REGION_BYTES
-#define ACCEL_STATIC_REGION_BYTES (32 * 1024)
+#define ACCEL_STATIC_REGION_BYTES (64 * 1024)
 #endif
 
 static __attribute__((aligned(4096))) char accel_fixed_region[ACCEL_STATIC_REGION_BYTES];
@@ -43,9 +46,10 @@ void AccelSetup(void) {
 
 // Serializer output regions use static BSS so we don't pound the small
 // htif_nano malloc heap. Sized to absorb HPB-realistic payloads: 10 top-level
-// messages × (ITERS+1) iters × up to a few KB each.
+// messages × (ITERS+1) iters × up to ~2 KB each ≈ 80 KB; 128 KB gives headroom
+// without bloating the ELF.
 #ifndef ACCEL_SER_DATA_BYTES
-#define ACCEL_SER_DATA_BYTES  (512 * 1024)
+#define ACCEL_SER_DATA_BYTES  (128 * 1024)
 #endif
 #ifndef ACCEL_SER_PTR_COUNT
 #define ACCEL_SER_PTR_COUNT   512

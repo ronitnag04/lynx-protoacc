@@ -90,11 +90,9 @@ int main(void) {
     // Serializer output region: one ptr per (message × iter × warmup).
     const int n_top = TOP_MESSAGE_COUNT;
     const int total_ptrs = n_top * (ITERS + 1) + 1;  // +1 warmup ptr headroom
-    // Data region sized for realistic HPB string lengths (~1 KB each, with
-    // ~10 strings per message × 10 messages × 4 iters = ~400 KB theoretical
-    // max, but most messages are smaller). 64 KB is a safe middle ground
-    // that fits the htif_nano heap.
-    volatile char **ptrs = AccelSetupAllocRegionSerializer(total_ptrs + 4, 64 * 1024);
+    // Data region sized to absorb 40 iters × up to ~2 KB per message. Matches
+    // the static ACCEL_SER_DATA_BYTES region in accel_rocc.c (128 KB).
+    volatile char **ptrs = AccelSetupAllocRegionSerializer(total_ptrs + 4, 128 * 1024);
     printf("%s: after SetupSer ptrs=%p\n", BENCH_NAME, ptrs);
 
     // Fix up nested-message pointers FIRST so strings can reference nested

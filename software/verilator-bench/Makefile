@@ -23,10 +23,12 @@ COMMON_SRCS := accel_rocc.c
 COMMON_OBJS := $(addprefix $(BUILD)/,$(COMMON_SRCS:.c=.o))
 HEADERS     := accel_rocc.h rocc.h bench_common.h
 
-TINY_BENCHES := bench_tiny_ser bench_tiny_des
-HPB_BENCHES  := bench0_ser bench1_ser bench2_ser bench3_ser bench4_ser bench5_ser
-REPRO_CASES  := 1 2 3 4 5 6 7 8 9 10 11 12 13 14
-REPRO_ELFS   := $(addprefix $(BUILD)/,$(addprefix bench_repro_c,$(addsuffix .riscv,$(REPRO_CASES))))
+TINY_BENCHES     := bench_tiny_ser bench_tiny_des
+HPB_SER_BENCHES  := bench0_ser bench1_ser bench2_ser bench3_ser bench4_ser bench5_ser
+HPB_DES_BENCHES  := bench0_des bench1_des bench2_des bench3_des bench4_des bench5_des
+HPB_BENCHES      := $(HPB_SER_BENCHES) $(HPB_DES_BENCHES)
+REPRO_CASES      := 1 2 3 4 5 6 7 8 9 10 11 12 13 14
+REPRO_ELFS       := $(addprefix $(BUILD)/,$(addprefix bench_repro_c,$(addsuffix .riscv,$(REPRO_CASES))))
 
 # Isolate benches: one ELF per (bench, msg_idx) pair. Pattern:
 #   build/isolate_bench<B>_m<I>.riscv serializes TOP_MESSAGE_INSTANCE_PTRS[I]
@@ -65,6 +67,16 @@ $(BUILD)/bench%_ser.o: bench_hpb_ser.c gen/bench%_descriptors.h $(HEADERS) | $(B
 	      -c $< -o $@
 
 $(BUILD)/bench%_ser.riscv: $(BUILD)/bench%_ser.o $(BUILD)/gen/bench%_data.o $(COMMON_OBJS) | $(BUILD)
+	$(CC) $(LDFLAGS) $^ -o $@
+
+# HyperProtoBench deserializer benches. Same pattern as ser but wires in
+# bench_hpb_des.c instead.
+$(BUILD)/bench%_des.o: bench_hpb_des.c gen/bench%_descriptors.h $(HEADERS) | $(BUILD)
+	$(CC) $(CFLAGS) -DBENCH_NAME=\"bench$*\" \
+	      -DBENCH_DESCRIPTORS_H=\"bench$*_descriptors.h\" \
+	      -c $< -o $@
+
+$(BUILD)/bench%_des.riscv: $(BUILD)/bench%_des.o $(BUILD)/gen/bench%_data.o $(COMMON_OBJS) | $(BUILD)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 # Minimal reproducers for the multi-field dispatch bug.

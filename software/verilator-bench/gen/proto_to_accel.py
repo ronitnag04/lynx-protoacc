@@ -86,6 +86,68 @@ DEFAULT_MAX_NESTED_DEPTH = 5
 DEFAULT_MAX_STRING_LEN = 1024
 
 # ---------------------------------------------------------------------------
+# Protobuf wire-format encoder (Python side, for generating deserializer inputs).
+#
+# Wire types:
+#   0 = VARINT (int32/64, uint32/64, bool, enum, sint32/64)
+#   1 = 64-BIT (fixed64, sfixed64, double)
+#   2 = LEN    (string, bytes, embedded messages)
+#   5 = 32-BIT (fixed32, sfixed32, float)
+# ---------------------------------------------------------------------------
+
+_WIRE_TYPE_BY_PROTO_CODE: Dict[int, int] = {
+    PROTO_TYPE_CODES["double"]:   1,
+    PROTO_TYPE_CODES["float"]:    5,
+    PROTO_TYPE_CODES["int64"]:    0,
+    PROTO_TYPE_CODES["uint64"]:   0,
+    PROTO_TYPE_CODES["int32"]:    0,
+    PROTO_TYPE_CODES["fixed64"]:  1,
+    PROTO_TYPE_CODES["fixed32"]:  5,
+    PROTO_TYPE_CODES["bool"]:     0,
+    PROTO_TYPE_CODES["string"]:   2,
+    PROTO_TYPE_CODES["message"]:  2,
+    PROTO_TYPE_CODES["bytes"]:    2,
+    PROTO_TYPE_CODES["uint32"]:   0,
+    PROTO_TYPE_CODES["enum"]:     0,
+    PROTO_TYPE_CODES["sfixed32"]: 5,
+    PROTO_TYPE_CODES["sfixed64"]: 1,
+    PROTO_TYPE_CODES["sint32"]:   0,
+    PROTO_TYPE_CODES["sint64"]:   0,
+}
+
+
+def _encode_varint(v: int) -> bytes:
+    # Protobuf varint always treats the input as its unsigned 64-bit form.
+    v &= (1 << 64) - 1
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v == 0:
+            out.append(b)
+            break
+        out.append(b | 0x80)
+    return bytes(out)
+
+
+def _encode_tag(field_number: int, wire_type: int) -> bytes:
+    return _encode_varint((field_number << 3) | wire_type)
+
+
+def _zigzag32(n: int) -> int:
+    n = n & 0xFFFFFFFF
+    if n & 0x80000000:
+        n -= 0x1_0000_0000
+    return (n << 1) ^ (n >> 31)
+
+
+def _zigzag64(n: int) -> int:
+    n = n & 0xFFFFFFFFFFFFFFFF
+    if n & 0x8000000000000000:
+        n -= 0x1_0000_0000_0000_0000
+    return (n << 1) ^ (n >> 63)
+
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ResolvedField:
@@ -371,6 +433,12 @@ def emit_header(
         f.write("extern uint8_t* const TOP_MESSAGE_NESTED_POOLS[TOP_MESSAGE_COUNT];\n")
         f.write("extern const uint32_t* const TOP_MESSAGE_NESTED_SPECS[TOP_MESSAGE_COUNT];\n")
         f.write("extern const uint32_t TOP_MESSAGE_NESTED_COUNTS[TOP_MESSAGE_COUNT];\n")
+        # Wire-format tables for the deserializer. TOP_MESSAGE_WIRE[i] points
+        # to the byte array the deserializer reads from; TOP_MESSAGE_WIRE_LEN[i]
+        # is the number of bytes (exclusive of tail-cushion padding).
+        f.write("extern const uint8_t* const TOP_MESSAGE_WIRE[TOP_MESSAGE_COUNT];\n")
+        f.write("extern const uint32_t TOP_MESSAGE_WIRE_LEN[TOP_MESSAGE_COUNT];\n")
+        f.write("extern uint8_t* const TOP_MESSAGE_DES_DEST[TOP_MESSAGE_COUNT];\n")
         # Pre-built instances for serialize benchmarks.
         f.write("\n/* Pre-initialized cpp_obj instances (serializer inputs). */\n")
         for name in top_messages:
@@ -411,14 +479,19 @@ def emit_source(
         instance_sizes: Dict[str, int] = {}
         per_msg_string_specs: Dict[str, List[StringSpec]] = {}
         per_msg_nested_specs: Dict[str, List[NestedSpec]] = {}
+        per_msg_wire_bytes: Dict[str, bytes] = {}
         for top in top_messages:
             rm = resolved[top]
-            inst_bytes, nested_bytes, str_specs, payloads, n_specs = \
+            inst_bytes, nested_bytes, str_specs, payloads, n_specs, value_tree = \
                 build_instance_bytes(rm, resolved, seed, top, max_nested_depth,
                                      runtime_lengths, max_string_len)
             instance_sizes[top] = len(inst_bytes)
             per_msg_string_specs[top] = str_specs
             per_msg_nested_specs[top] = n_specs
+            # Wire-format encode the same values that were written into the
+            # cpp_obj. This is what the deserializer will ingest.
+            wire = encode_wire_from_values(value_tree)
+            per_msg_wire_bytes[top] = wire
 
             # INSTANCE buffer (top cpp_obj only).
             f.write(f"uint8_t {top}_INSTANCE[{len(inst_bytes)}] __attribute__((aligned(16))) = {{\n")
@@ -474,6 +547,37 @@ def emit_source(
             else:
                 f.write(f"const uint32_t {top}_NESTED_SPECS[1] = {{0}};\n\n")
 
+            # Wire-format bytes: exact bytes the deserializer ingests. These
+            # are produced by re-encoding the same value-tree that was
+            # written into the cpp_obj, so ser-path and des-path use identical
+            # data. The accelerator reads these sequentially in 16-byte aligned
+            # chunks; pad to a 16-byte boundary + a 16-byte cushion so the
+            # trailing read never runs off the array.
+            wire = per_msg_wire_bytes[top]
+            wire_len = len(wire)
+            pad = (16 - (wire_len % 16)) % 16
+            wire_padded = wire + b"\x00" * pad + b"\x00" * 16
+            f.write(f"const uint8_t {top}_WIRE[{len(wire_padded)}] "
+                    f"__attribute__((aligned(16))) = {{\n")
+            for i in range(0, len(wire_padded), 16):
+                row = wire_padded[i:i + 16]
+                f.write("  " + ", ".join(f"0x{b:02x}" for b in row) + ",\n")
+            f.write("};\n")
+            f.write(f"const uint32_t {top}_WIRE_LEN = {wire_len};\n\n")
+
+            # Destination cpp_obj scratch space for the deserializer. The hw
+            # writes hasbits at offset 0x10 and fields at their descriptor-
+            # specified offsets. String/bytes fields land in the fixed/array
+            # alloc regions set up by AccelSetup(); their slot in the dest
+            # cpp_obj receives a tagged pointer form analogous to the
+            # serializer's ArenaStringPtr. We size the dest buffer to the
+            # largest plausible obj_size including any nested message's own
+            # dest storage (the accelerator allocates nested dest buffers
+            # from the array-alloc region and writes a pointer into the
+            # parent slot).
+            f.write(f"uint8_t {top}_DES_DEST[{resolved[top].obj_size}] "
+                    f"__attribute__((aligned(16))) = {{0}};\n\n")
+
         # Top-level descriptor/name/size/instance tables.
         f.write("const uint64_t* const TOP_MESSAGE_DESCRIPTORS[TOP_MESSAGE_COUNT] = {\n")
         for n in top_messages:
@@ -524,6 +628,20 @@ def emit_source(
         f.write("const uint32_t TOP_MESSAGE_NESTED_COUNTS[TOP_MESSAGE_COUNT] = {\n")
         for n in top_messages:
             f.write(f"  {len(per_msg_nested_specs[n])},\n")
+        f.write("};\n\n")
+
+        # Wire-format tables for the deserializer benches.
+        f.write("const uint8_t* const TOP_MESSAGE_WIRE[TOP_MESSAGE_COUNT] = {\n")
+        for n in top_messages:
+            f.write(f"  {n}_WIRE,\n")
+        f.write("};\n\n")
+        f.write("const uint32_t TOP_MESSAGE_WIRE_LEN[TOP_MESSAGE_COUNT] = {\n")
+        for n in top_messages:
+            f.write(f"  {len(per_msg_wire_bytes[n])},\n")
+        f.write("};\n\n")
+        f.write("uint8_t* const TOP_MESSAGE_DES_DEST[TOP_MESSAGE_COUNT] = {\n")
+        for n in top_messages:
+            f.write(f"  {n}_DES_DEST,\n")
         f.write("};\n")
 
 
@@ -582,7 +700,15 @@ def _fill_primitive_fields(rm: ResolvedMessage, buf: bytearray, rng: random.Rand
                             payloads: bytearray, string_specs: List[StringSpec],
                             owner_instance: int,
                             runtime_lengths: Dict[str, Dict[str, List[int]]],
-                            max_string_len: int) -> int:
+                            max_string_len: int,
+                            # Parallel value-capture for wire encoding. If
+                            # value_sink is not None, {field_number: (proto_type, value)}
+                            # is appended as each primitive/string is generated. The
+                            # RNG order MUST match the cpp_obj builder so the values
+                            # we encode on the wire match the ones the serializer
+                            # sends.
+                            value_sink: Optional[Dict[int, Tuple[int, object]]] = None,
+                            ) -> int:
     """Populate primitive fields + emit string specs. Returns hasbits value.
 
     - buf: the cpp_obj bytes being built (rm.obj_size long).
@@ -615,6 +741,8 @@ def _fill_primitive_fields(rm: ResolvedMessage, buf: bytearray, rng: random.Rand
                 payload_offset=payload_offset,
                 length=length,
             ))
+            if value_sink is not None:
+                value_sink[rf.field_number] = (rf.proto_type_code, payload)
         elif rf.proto_type_code in (
             PROTO_TYPE_CODES["int32"], PROTO_TYPE_CODES["uint32"],
             PROTO_TYPE_CODES["sint32"], PROTO_TYPE_CODES["fixed32"],
@@ -622,6 +750,8 @@ def _fill_primitive_fields(rm: ResolvedMessage, buf: bytearray, rng: random.Rand
         ):
             val = rng.randint(0, 0x7fffffff)
             buf[rf.offset:rf.offset + 4] = val.to_bytes(4, "little")
+            if value_sink is not None:
+                value_sink[rf.field_number] = (rf.proto_type_code, val)
         elif rf.proto_type_code in (
             PROTO_TYPE_CODES["int64"], PROTO_TYPE_CODES["uint64"],
             PROTO_TYPE_CODES["sint64"], PROTO_TYPE_CODES["fixed64"],
@@ -629,14 +759,24 @@ def _fill_primitive_fields(rm: ResolvedMessage, buf: bytearray, rng: random.Rand
         ):
             val = rng.randint(0, 0x7fffffffffffffff)
             buf[rf.offset:rf.offset + 8] = val.to_bytes(8, "little")
+            if value_sink is not None:
+                value_sink[rf.field_number] = (rf.proto_type_code, val)
         elif rf.proto_type_code == PROTO_TYPES_BOOL:
             buf[rf.offset:rf.offset + 1] = bytes([1])
+            if value_sink is not None:
+                value_sink[rf.field_number] = (rf.proto_type_code, 1)
         elif rf.proto_type_code == PROTO_TYPE_CODES["float"]:
             import struct
-            buf[rf.offset:rf.offset + 4] = struct.pack("<f", rng.uniform(0, 1000))
+            fval = rng.uniform(0, 1000)
+            buf[rf.offset:rf.offset + 4] = struct.pack("<f", fval)
+            if value_sink is not None:
+                value_sink[rf.field_number] = (rf.proto_type_code, fval)
         elif rf.proto_type_code == PROTO_TYPE_CODES["double"]:
             import struct
-            buf[rf.offset:rf.offset + 8] = struct.pack("<d", rng.uniform(0, 1000))
+            fval = rng.uniform(0, 1000)
+            buf[rf.offset:rf.offset + 8] = struct.pack("<d", fval)
+            if value_sink is not None:
+                value_sink[rf.field_number] = (rf.proto_type_code, fval)
         else:
             present = False
         if present:
@@ -661,8 +801,9 @@ def build_instance_bytes(
     max_nested_depth: int,
     runtime_lengths: Dict[str, Dict[str, List[int]]],
     max_string_len: int,
-) -> Tuple[bytes, bytes, List[StringSpec], bytes, List[NestedSpec]]:
-    """Return (top_cpp_obj_bytes, nested_pool_bytes, string_specs, payloads, nested_specs).
+) -> Tuple[bytes, bytes, List[StringSpec], bytes, List[NestedSpec], Dict]:
+    """Return (top_cpp_obj_bytes, nested_pool_bytes, string_specs, payloads,
+    nested_specs, value_tree).
 
     Top cpp_obj holds primitives only. Strings live in a separate pool (see
     StringSpec). Nested cpp_obj instances live in another separate pool; for
@@ -673,6 +814,11 @@ def build_instance_bytes(
     Cycles / very-deep nesting are capped by max_nested_depth. A submessage
     field at depth >= max_nested_depth becomes a zero-present slot (no
     instance allocated, not marked in hasbits).
+
+    value_tree is a hierarchical {field_number: (proto_type, value | nested_tree)}
+    map describing exactly the values that were written into the cpp_obj (or
+    into string payloads). It's used to drive the wire-format encoder that
+    feeds the ProtoAcc deserializer.
     """
     rng = det_rng(seed, top_name)
     # Fill the top-level cpp_obj.
@@ -692,6 +838,7 @@ def build_instance_bytes(
         current_instance_id: int,
         depth: int,
         rng_local: random.Random,
+        value_sink: Dict,
     ) -> int:
         # Primitives + strings.
         hb = _fill_primitive_fields(
@@ -699,6 +846,7 @@ def build_instance_bytes(
             owner_instance=current_instance_id,
             runtime_lengths=runtime_lengths,
             max_string_len=max_string_len,
+            value_sink=value_sink,
         )
         # Nested submessage fields.
         if depth >= max_nested_depth:
@@ -726,23 +874,94 @@ def build_instance_bytes(
                 parent_slot_offset=rf.offset,
                 nested_offset=child_offset,
             ))
-            # Recurse.
-            emit_instance(child_rm, child_buf, child_id, depth + 1, child_rng)
+            # Recurse. child_values is a value-tree for the nested message;
+            # we store it against the parent's field number so the wire
+            # encoder can recurse on it later.
+            child_values: Dict = {}
+            emit_instance(child_rm, child_buf, child_id, depth + 1, child_rng, child_values)
             # Copy filled child bytes back into nested_pool.
             nested_pool[child_offset:child_offset + child_rm.obj_size] = child_buf
             rel_fn = rf.field_number - current_rm.min_field_no + 1
             hb |= 1 << rel_fn
+            value_sink[rf.field_number] = (
+                PROTO_TYPE_CODES["message"],
+                (child_rm.name, child_values),
+            )
         _write_hasbits(current_rm, current_buf, hb)
         return hb
 
-    emit_instance(rm, buf, 0, 0, rng)
+    value_tree: Dict = {}
+    emit_instance(rm, buf, 0, 0, rng, value_tree)
 
     # Tail cushion for payloads so trailing 16B reads don't run off.
     while len(payloads) % 16:
         payloads += b"\x00"
     payloads += b"\x00" * 16
 
-    return bytes(buf), bytes(nested_pool), string_specs, bytes(payloads), nested_specs
+    return (bytes(buf), bytes(nested_pool), string_specs, bytes(payloads),
+            nested_specs, value_tree)
+
+
+def encode_wire_from_values(values: Dict) -> bytes:
+    """Serialize a value-tree (as produced by build_instance_bytes) to protobuf
+    wire format. Fields are emitted in ascending field_number order (matches
+    what Google protobuf's C++ runtime emits for optional fields).
+    """
+    out = bytearray()
+    for field_number in sorted(values.keys()):
+        proto_type, val = values[field_number]
+        wire_type = _WIRE_TYPE_BY_PROTO_CODE.get(proto_type)
+        if wire_type is None:
+            continue
+        if proto_type == PROTO_TYPE_CODES["string"] or proto_type == PROTO_TYPE_CODES["bytes"]:
+            out += _encode_tag(field_number, 2)
+            out += _encode_varint(len(val))
+            out += val
+        elif proto_type == PROTO_TYPE_CODES["message"]:
+            child_name, child_values = val
+            sub_bytes = encode_wire_from_values(child_values)
+            out += _encode_tag(field_number, 2)
+            out += _encode_varint(len(sub_bytes))
+            out += sub_bytes
+        elif proto_type == PROTO_TYPE_CODES["bool"]:
+            out += _encode_tag(field_number, 0)
+            out += _encode_varint(1 if val else 0)
+        elif proto_type in (PROTO_TYPE_CODES["int32"], PROTO_TYPE_CODES["int64"]):
+            # int32/64 on wire: encode the signed value in its 64-bit two's-complement varint.
+            out += _encode_tag(field_number, 0)
+            out += _encode_varint(val)
+        elif proto_type in (PROTO_TYPE_CODES["uint32"], PROTO_TYPE_CODES["uint64"],
+                            PROTO_TYPE_CODES["enum"]):
+            out += _encode_tag(field_number, 0)
+            out += _encode_varint(val)
+        elif proto_type == PROTO_TYPE_CODES["sint32"]:
+            out += _encode_tag(field_number, 0)
+            out += _encode_varint(_zigzag32(val))
+        elif proto_type == PROTO_TYPE_CODES["sint64"]:
+            out += _encode_tag(field_number, 0)
+            out += _encode_varint(_zigzag64(val))
+        elif proto_type == PROTO_TYPE_CODES["fixed32"]:
+            out += _encode_tag(field_number, 5)
+            out += (val & 0xFFFFFFFF).to_bytes(4, "little")
+        elif proto_type == PROTO_TYPE_CODES["sfixed32"]:
+            out += _encode_tag(field_number, 5)
+            out += (val & 0xFFFFFFFF).to_bytes(4, "little")
+        elif proto_type == PROTO_TYPE_CODES["fixed64"]:
+            out += _encode_tag(field_number, 1)
+            out += (val & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+        elif proto_type == PROTO_TYPE_CODES["sfixed64"]:
+            out += _encode_tag(field_number, 1)
+            out += (val & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+        elif proto_type == PROTO_TYPE_CODES["float"]:
+            import struct
+            out += _encode_tag(field_number, 5)
+            out += struct.pack("<f", val)
+        elif proto_type == PROTO_TYPE_CODES["double"]:
+            import struct
+            out += _encode_tag(field_number, 1)
+            out += struct.pack("<d", val)
+        # unknown types are silently skipped (matches skip_reason behavior)
+    return bytes(out)
 
 
 # Need this alias since key name has a digit-only variant used above.

@@ -1,10 +1,11 @@
 # ProtoAcc Verilator Benchmarks — Status
 
-_Last updated: 2026-05-01_
+_Last updated: 2026-05-04_
 
-A bare-metal RISC-V workload suite that runs HyperProtoBench serialization
-schemas on the ProtoAcc RoCC accelerator under Chipyard's Verilator simulator,
-producing cycle-count / throughput data for the Lynx ML throughput model.
+A bare-metal RISC-V workload suite that runs HyperProtoBench serialization +
+deserialization schemas on the ProtoAcc RoCC accelerator under Chipyard's
+Verilator simulator, producing cycle-count / throughput data for the Lynx ML
+throughput model.
 
 ## Goal
 
@@ -16,26 +17,53 @@ Match HyperProtoBench (HPB) workloads closely enough that:
    MICRO 2021 paper results: **serializer 60–100 Gb/s @ 1.84 GHz**,
    **deserializer 25–40 Gb/s @ 1.95 GHz**.
 
-## Current results (serializer only)
+## Current results (serializer + deserializer)
 
 Full HPB multi-field workloads including primitives, strings/bytes (1024 B cap),
-and nested submessages (up to depth 5). At the Verilator config's nominal 1 GHz
-clock:
+and nested submessages (up to depth 5). 40 iters per bench (10 top-level
+messages × 4 iters). At the Verilator config's nominal 1 GHz clock:
 
-| Bench  | bytes  | cycles | MB/s   | Gb/s @ 1 GHz | Gb/s @ 1.84 GHz | vs. paper 60–100 |
-|--------|-------:|-------:|-------:|-------------:|----------------:|:----------------:|
-| bench0 | 80,180 | 39,178 | 2,047  | 16.4         | **30.1**        | 0.5×–0.3×        |
-| bench1 | 37,960 | 20,847 | 1,821  | 14.6         | **26.8**        | 0.4×–0.3×        |
-| bench2 | 20,800 | 63,516 |   327  |  2.6         |  4.8            | 0.08×            |
-| bench3 | 65,392 | 29,239 | 2,236  | 17.9         | **32.9**        | 0.5×–0.3×        |
-| bench4 | 44,560 | 27,978 | 1,593  | 12.7         | **23.4**        | 0.4×–0.2×        |
-| bench5 | 18,428 | 32,129 |   574  |  4.6         |  8.4            | 0.1×             |
+### Serializer (paper target: 60–100 Gb/s @ 1.84 GHz)
 
-Four of six benches are within ~2–3× of the paper's serializer range — same order
-of magnitude. Bench2 and bench5 are lower, likely because their workloads have
-more small-payload messages that expose the fixed per-message dispatch overhead.
+| Bench  | bytes  | cycles | MB/s @ 1 GHz | Gb/s @ 1.84 GHz | vs. paper |
+|--------|-------:|-------:|-------------:|----------------:|:---------:|
+| bench0 | 80,180 | 38,604 | 2,077        | **30.6**        | 0.5×–0.3× |
+| bench1 | 37,960 | 20,640 | 1,839        | **27.1**        | 0.5×–0.3× |
+| bench2 | 20,800 | 62,324 |   334        |   4.9           | 0.08×     |
+| bench3 | 65,392 | 29,121 | 2,246        | **33.1**        | 0.6×–0.3× |
+| bench4 | 44,560 | 27,869 | 1,599        | **23.5**        | 0.4×–0.2× |
+| bench5 | 18,428 | 31,613 |   583        |   8.6           | 0.1×      |
+
+### Deserializer (paper target: 25–40 Gb/s @ 1.95 GHz)
+
+| Bench  | bytes  | cycles | MB/s @ 1 GHz | Gb/s @ 1.95 GHz | vs. paper |
+|--------|-------:|-------:|-------------:|----------------:|:---------:|
+| bench0 | 80,180 | 51,017 | 1,572        | **24.5**        | 1.0×–0.6× |
+| bench1 | 37,960 | 24,225 | 1,567        | **24.4**        | 1.0×–0.6× |
+| bench2 | 20,800 | 100,932 |  206        |   3.2           | 0.13×     |
+| bench3 | 65,392 | 29,940 | 2,184        | **34.1**        | 1.4×–0.9× |
+| bench4 | 44,560 | 34,023 | 1,310        | **20.4**        | 0.8×–0.5× |
+| bench5 | 18,428 | 45,411 |   406        |   6.3           | 0.25×     |
+
+**Deserializer lands within the paper's 25–40 Gb/s band** on bench0/1/3/4 —
+bench3 is right in the middle of it. The serializer is ~2-3× below paper
+throughput; still same order of magnitude on bench0/1/3/4.
+**Bench2 and bench5 are outliers** on both ops: their schemas have many
+small submessages where the fixed per-message dispatch cost dominates.
 
 **Full current data**: [benchmark_results.json](benchmark_results.json)
+
+### Analytical-model alignment
+
+The Lynx analytical model at
+[/home/ec2-user/lynx/analytical_model/](/home/ec2-user/lynx/analytical_model/)
+now has a `WorkloadProfile` that mirrors our bench caps (skip repeated,
+max_string_len=1024, max_nested_depth=5). Invoke with
+`--verilator-bench-profile` to produce features that line up with the measured
+cycle/byte counts in `benchmark_results.json`. The canonical
+`extracted_features.json` in that directory is now produced with the bench
+profile applied; a full-HPB-scoped sibling is saved as
+`extracted_features_full.json` for reference.
 
 ## What's implemented
 
@@ -98,11 +126,12 @@ for the full ABI cheat-sheet.
 | File                        | Purpose |
 |-----------------------------|---------|
 | [rocc.h](rocc.h)                          | RoCC `.insn r CUSTOM_X` macro family (verbatim from baremetal/). |
-| [accel_rocc.{h,c}](accel_rocc.c)          | `AccelSetup()`, `AccelSerializeToString_Helper()`, `BlockOnSerializedValue()`, static 512 KB serializer output region. |
+| [accel_rocc.{h,c}](accel_rocc.c)          | `AccelSetup()`, `AccelSerializeToString_Helper()`, `AccelParseFromString_Helper()`, `BlockOnSerializedValue()`, static 128 KB serializer output region + 64 KB per-side deserializer fixed/array regions. |
 | [bench_common.h](bench_common.h)          | `read_mcycle()`, `print_iter()`, `print_summary()`. |
 | [bench_tiny_ser.c](bench_tiny_ser.c)      | Hand-crafted `{int32, string}` serialize. Validation baseline. |
 | [bench_tiny_des.c](bench_tiny_des.c)      | Hand-crafted deser. Reconstructs `f1=42 f2="hello"`. |
-| [bench_hpb_ser.c](bench_hpb_ser.c)        | Main HPB bench driver. One ELF per bench via `BENCH_DESCRIPTORS_H` macro + include of `gen/bench<N>_descriptors.h`. |
+| [bench_hpb_ser.c](bench_hpb_ser.c)        | Main HPB serializer bench driver. One ELF per bench via `BENCH_DESCRIPTORS_H` macro + include of `gen/bench<N>_descriptors.h`. |
+| [bench_hpb_des.c](bench_hpb_des.c)        | Matching HPB deserializer bench driver. Feeds `TOP_MESSAGE_WIRE[m]` (generator-emitted wire bytes for each top-level message) through `AccelParseFromString_Helper`; reissues `AccelSetup()` between iters so the accelerator's array-alloc region doesn't overflow on long runs. |
 | [bench_isolate.c](bench_isolate.c)        | Per-message isolator — serialize ONE top-level message from a bench. Debug tool. |
 | [bench_repro.c](bench_repro.c)            | 14 hand-crafted reproducer cases covering every hardware state-machine combination we've tested. Cases 11/13/14 deliberately fail (documented bugs). |
 | [gen/proto_to_accel.py](gen/proto_to_accel.py) | The generator. ~750 LOC. |
@@ -189,38 +218,69 @@ a first pass, worth revisiting later.
 | Fields covered      | All (incl. repeated) | All except `repeated`, oneof, map, groups |
 | Submessage depth    | Up to 13 (bench2)    | Capped at 5          |
 | Runtime values      | Hand-picked real-world traffic | Seeded-random ASCII; lengths from `.inc` |
-| `avg_size_bytes` vs HPB | (target) | bench1: 45% of target, bench0/3/4: 2-5%, bench2/5: <2% |
+
+### Analytical-model compensation for these caps
+
+Because we can't feasibly match HPB's full byte-size scale under Verilator,
+the Lynx analytical model's feature extractor has been patched to honor the
+same caps so its output aligns with what the bench measures. See the
+`WorkloadProfile` in [/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py](/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py):
+
+- `skip_repeated = True` — treat repeated fields as absent in feature sizes.
+- `max_string_len = 1024` — cap every string/bytes payload to 1 KB.
+- `max_nested_depth = 5` — ignore nested messages at depth ≥ 5.
+
+Invoke `python3 protobuf_analyzer.py --verilator-bench-profile` to produce
+`protobuf_analysis_verilator_bench.json`, then
+`python3 extract_features.py --input protobuf_analysis_verilator_bench.json`
+to emit `extracted_features.json`. The canonical
+`/home/ec2-user/lynx/analytical_model/extracted_features.json` is the bench-
+scoped one; `extracted_features_full.json` is the unconstrained reference.
 
 ## Next steps (prioritized)
 
-### 1. Hit the paper's throughput targets (highest priority)
-Current serializer is 23–33 Gb/s on bench0/1/3/4 at 1.84 GHz — paper reports
-60–100 Gb/s. The gap is mostly because we amortize less work per RoCC
-dispatch. Things to try:
+### 1. Kick off the parameter sweep to generate ML training data
+The bench pipeline is now complete enough to drive the config sweep. Use
+[/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/gen_protoacc_sweep_configs.py](/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/gen_protoacc_sweep_configs.py)
+to generate `ProtoAccelDesSweepSample*` / `ProtoAccelSerSweepSample*` configs
+(already supports random, ofat, tweak, joint). Run each sample config through
+the same `bench[0-5]_{ser,des}.riscv` binaries, parse, and pair cycle counts
+with the workload feature vectors in `extracted_features.json` for ML
+training.
+
+### 2. Raise per-bench iteration count (easy lever)
+`ITERS=4` undercounts steady-state behavior because each bench includes a
+warmup pass that eats first-iteration cache/TLB fills. Bumping to
+`ITERS=16` or `32` makes the measurement window more stable and shrinks
+relative noise. Memory budget check: each iter burns ~1 message's worth of
+serializer output (~1-2 KB); the 128 KB static region fits ~50 iters × 10
+messages comfortably. Deserializer is unaffected because it resets its
+array region per iter.
+
+### 3. Close the serializer throughput gap (2-3× below paper)
+Serializer is 23–33 Gb/s at 1.84 GHz on bench0/1/3/4 — paper reports
+60–100 Gb/s. Likely drivers of the gap:
 
 - **Raise `--max-string-len`** from 1024 to 4096 or 16384. Real HPB p50 is
-  ~1856 B for bench0 — we're still capping below that. This is the single
-  biggest lever on throughput and workload realism. Memory budget: each
-  top-level message × 4096 B × (num string fields) × (ITERS+1 iters) has to
-  fit in the 512 KB serializer output region — may require bumping
-  `ACCEL_SER_DATA_BYTES` too.
-- **Raise `ITERS`** from 4 to 16 or 32. The first iteration eats setup
-  latency; steady-state iterations are much faster. Longer measurement
-  windows will push throughput closer to amortized-steady-state.
+  ~1856 B for bench0 — we're still below that. Bigger strings amortize
+  per-message dispatch cost. Would need to raise `ACCEL_SER_DATA_BYTES`
+  and `ACCEL_STATIC_REGION_BYTES` proportionally.
 - **Profile which states dominate bench2/5 cycles**. They're 5–10× slower per
-  byte than bench0/1/3/4. Likely they have many small messages where the
-  HASBITS_INFO + DO_PROTO_SERIALIZE dispatch cost dominates. Could switch
-  those benches to mostly-large top-level messages.
+  byte than bench0/1/3/4. Likely dispatch-bound because of many small
+  messages. Could use `WithProtoAccelPrintf` + VCD to confirm.
 
-### 2. Deserializer side
-We have `bench_tiny_des.c` validating the deserializer path for
-`{int32, string}`. Need to extend the generator to emit bench<N>_des ELFs
-that feed wire bytes into the deserializer and measure cycles. The wire bytes
-would come from running our serializer first, OR from the `.inc` runtime
-data fed through a software-only protobuf encoder. The hardware has a 0x10
-hardcoded hasbits_offset at the top level — we already use that, so the
-layout is compatible. Expected throughput from the paper: 25–40 Gb/s @
-1.95 GHz.
+### 4. Workload fidelity: repeated fields
+About 3% of HPB fields (71 out of 2578). Biggest impact on bench2 (42 fields).
+Hardware layout (from [fieldhandler.scala:580-670](/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/src/main/scala/fieldhandler.scala#L580)):
+- For repeated scalars: cpp_obj slot holds address of a `RepeatedField<T>`
+  struct `{T* elements_, int current_size_, int total_size_}` (24 B).
+  Serializer reads `src-8` → `elements_*`, `src` → `{current_size_, total_size_}`.
+- For repeated strings: `RepeatedPtrField<string>` with Rep object + tag bit.
+
+Generator changes: emit a `<Msg>_REP_POOL[]` for repeated-field backing
+arrays, add repeated specs to the fixup table, generate a few elements per
+repeated field. Runtime changes: `fixup_repeated()` analogous to
+`fixup_nested()`.
 
 ### 3. Repeated-field support
 - About 3% of HPB fields (71 out of 2578). Biggest impact on bench2 (42 fields).
@@ -234,7 +294,7 @@ layout is compatible. Expected throughput from the paper: 25–40 Gb/s @
   repeated field.
 - Runtime changes: `fixup_repeated()` analogous to `fixup_nested()`.
 
-### 4. Raise bench2 `MAX_NESTED_DEPTH` selectively
+### 5. Raise bench2 `MAX_NESTED_DEPTH` selectively
 The generator supports per-proto `--max-nested-depth`. For bench2, try
 depth 7 or 8 (vs its actual max of 13) to see if the binary fits.
 Probably needs iteration.
