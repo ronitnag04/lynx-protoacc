@@ -10,8 +10,9 @@ Usage:
                               [--top-message M10] [--seed 7]
 
 Design:
-- Reuses ProtobufAnalyzer from /home/ec2-user/lynx/analytical_model/protobuf_analyzer.py
-  to parse the .proto into Message/Field dataclasses.
+- Reuses ProtobufAnalyzer from the Lynx repo's analytical_model/protobuf_analyzer.py
+  (sibling submodule ``software/lynx``, or override with ``LYNX_ROOT``).
+  Parses the .proto into Message/Field dataclasses.
 - Emits one ACCEL_DESCRIPTOR array + one cpp_obj layout per message.
 - Fills cpp_obj slots with reproducible pseudo-random data (via --seed).
 - Handles: primitive scalars, string/bytes (tagged ArenaStringPtr), nested messages.
@@ -32,6 +33,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import os
 import random
 import string
 import sys
@@ -42,9 +44,21 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Reuse lynx's protobuf parser by importing it directly.
 # ---------------------------------------------------------------------------
-LYNX_ANALYZER = Path("/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py")
+def _lynx_analyzer_path() -> Path:
+    env = os.environ.get("LYNX_ROOT")
+    if env:
+        root = Path(env).expanduser().resolve()
+    else:
+        root = Path(__file__).resolve().parent.parent / "lynx"
+    return root / "analytical_model" / "protobuf_analyzer.py"
+
+
+LYNX_ANALYZER = _lynx_analyzer_path()
 if not LYNX_ANALYZER.is_file():
-    sys.exit(f"Error: expected {LYNX_ANALYZER} to exist")
+    sys.exit(
+        f"Error: Lynx analyzer not found at {LYNX_ANALYZER}. "
+        "Use the lynx submodule at generators/protoacc/software/lynx or set LYNX_ROOT."
+    )
 
 spec = importlib.util.spec_from_file_location("protobuf_analyzer", LYNX_ANALYZER)
 pa_mod = importlib.util.module_from_spec(spec)

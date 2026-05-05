@@ -35,11 +35,24 @@ build/                         # Build artifacts (.gitignored)
 
 ## Prerequisites
 
+Layout inside Chipyard: this directory lives at
+`generators/protoacc/software/verilator-bench`, next to the **lynx** submodule
+at `generators/protoacc/software/lynx` (`Makefile` / `proto_to_accel.py` use
+that sibling path; override with `LYNX_ROOT` if your checkout differs).
+
+Environment variables (optional overrides):
+
+| Variable | Purpose |
+|----------|---------|
+| `CHIPYARD_ROOT` | Chipyard repo root. `run_sweep.sh` and `parse_results.py` default it by walking up from this directory. |
+| `CHIPYARD` | Alias read by `parse_results.py` if `CHIPYARD_ROOT` is unset. |
+| `LYNX_ROOT` | Root of the Lynx repo when not using `../lynx` next to this folder. |
+
 Source the Chipyard env (puts `riscv64-unknown-elf-gcc`, Verilator, and the
 sbt/firtool toolchain on PATH):
 
 ```bash
-source /home/ec2-user/hyperscale-grpc-chipyard/env.sh
+source "${CHIPYARD_ROOT:?}/env.sh"
 ```
 
 For the sweep, `run_sweep.sh` also needs GNU parallel — install via
@@ -53,7 +66,7 @@ Reads each HPB `.proto` + `.inc`, samples per-field string/bytes lengths from
 the `.inc` runtime data, and emits `gen/bench<N>_{descriptors.h,data.c}`.
 
 ```bash
-cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
+cd generators/protoacc/software/verilator-bench   # from Chipyard root
 make gen
 ```
 
@@ -136,14 +149,12 @@ picks up where it left off with no wasted Verilator build cost.
 This lives in the Lynx repo, not here:
 
 ```bash
-python3 /home/ec2-user/lynx/build_training_dataset.py \
+python3 ../lynx/build_training_dataset.py \
     --sweep-csv /tmp/sweep.csv \
-    --output    /tmp/training.csv \
-    --npy-dir   /tmp/training_npy
+    --output-base-dir /tmp/training_data
 ```
 
-See [/home/ec2-user/lynx/README.md](/home/ec2-user/lynx/README.md) for the
-downstream training pipeline.
+See [../lynx/README.md](../lynx/README.md) for the downstream training pipeline.
 
 ## CSV schema (sweep output)
 
@@ -169,15 +180,15 @@ For debugging a single bench on the baseline config without going through
 
 ```bash
 # Build the baseline sim (cached after first time):
-cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
+cd sims/verilator    # from Chipyard root
 make CONFIG=ProtoAccelRocketBaseConfig -j$(nproc)
 
 # Run bench1 serialize on it:
 BREAK_SIM_PREREQ=1 LOADMEM=1 make CONFIG=ProtoAccelRocketBaseConfig run-binary-fast \
-    BINARY=/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/build/bench1_ser.riscv
+    BINARY="$(pwd)/../../generators/protoacc/software/verilator-bench/build/bench1_ser.riscv"
 
 # Aggregate bench logs in the baseline output dir → JSON:
-cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
+cd ../../generators/protoacc/software/verilator-bench
 python3 parse_results.py --output benchmark_results.json
 ```
 
@@ -199,7 +210,7 @@ ABI details, and the roadmap.
 
 ## Generator notes (`proto_to_accel.py`)
 
-Parses `.proto` + `.inc` via [lynx/analytical_model/protobuf_analyzer.py](/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py).
+Parses `.proto` + `.inc` via [../lynx/analytical_model/protobuf_analyzer.py](../lynx/analytical_model/protobuf_analyzer.py).
 Emits per top-level message M:
 
 ```

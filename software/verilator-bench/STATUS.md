@@ -17,7 +17,7 @@ RoCC accelerator under Chipyard's Verilator simulator. Outputs:
 
 Match HyperProtoBench (HPB) workloads closely enough that:
 1. The cycle-count data lines up with the analytical features in
-   [/home/ec2-user/lynx/analytical_model/extracted_features.json](/home/ec2-user/lynx/analytical_model/extracted_features.json)
+   [../lynx/analytical_model/extracted_features.json](../lynx/analytical_model/extracted_features.json)
    (keyed on `bench0`..`bench5`).
 2. Measured throughput falls in the same order of magnitude as the ProtoAcc
    MICRO 2021 paper results: **serializer 60–100 Gb/s @ 1.84 GHz**,
@@ -62,7 +62,7 @@ small submessages where the fixed per-message dispatch cost dominates.
 ### Analytical-model alignment
 
 The Lynx analytical model at
-[/home/ec2-user/lynx/analytical_model/](/home/ec2-user/lynx/analytical_model/)
+[../lynx/analytical_model/](../lynx/analytical_model/)
 now has a `WorkloadProfile` that mirrors our bench caps (skip repeated,
 max_string_len=1024, max_nested_depth=5). Invoke with
 `--verilator-bench-profile` to produce features that line up with the measured
@@ -76,7 +76,7 @@ profile applied; a full-HPB-scoped sibling is saved as
 ### 1. Verilator sim config
 - `ProtoAccelRocketBaseConfig` — direct-attach Rocket + 1 ProtoAcc serializer +
   1 ProtoAcc deserializer, no ReRoCC. Defined in
-  [chipyard/src/main/scala/config/HyperscaleConfigs.scala](/home/ec2-user/hyperscale-grpc-chipyard/generators/chipyard/src/main/scala/config/HyperscaleConfigs.scala).
+  [HyperscaleConfigs.scala](../../../chipyard/src/main/scala/config/HyperscaleConfigs.scala).
 - `ProtoAccelRocketDebugConfig` — same but with `WithProtoAccelPrintf` for
   synthesis-path debug prints (does nothing on Verilator in practice; left
   wired for FireSim).
@@ -85,7 +85,7 @@ profile applied; a full-HPB-scoped sibling is saved as
 [proto_to_accel.py](proto_to_accel.py)
 
 - Reuses the Lynx `ProtobufAnalyzer` directly (imports from
-  `/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py`) so we get the
+  `../lynx/analytical_model/protobuf_analyzer.py`, or `LYNX_ROOT` if overridden) so we get the
   same per-field string/bytes length distributions the analytical features
   are computed from.
 - Emits per-top-message:
@@ -124,8 +124,7 @@ profile applied; a full-HPB-scoped sibling is saved as
   with `{char*, size_t}` layout.
 - Nested submessage: cpp_obj slot is a raw pointer (not tagged).
 
-See [reference_protoacc_abi.md](/home/ec2-user/.claude/projects/-home-ec2-user/memory/reference_protoacc_abi.md)
-for the full ABI cheat-sheet.
+See internal ProtoAcc / RTL documentation for the full ABI cheat-sheet (hardware descriptor layout and hasbits).
 
 ### 5. Files in this directory
 
@@ -154,24 +153,24 @@ for the full ABI cheat-sheet.
 **Single-config smoke test** (one bench on the baseline sim):
 
 ```bash
-source /home/ec2-user/hyperscale-grpc-chipyard/env.sh
+source "${CHIPYARD_ROOT}/env.sh"
 
 # One-time: Verilator baseline sim (~15 min on first build, cached after).
-make -C /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator \
+make -C "${CHIPYARD_ROOT}/sims/verilator" \
     CONFIG=ProtoAccelRocketBaseConfig -j$(nproc)
 
 # Bench descriptors + ELFs (build/bench[0-5]_{ser,des}.riscv):
-cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
+cd "${CHIPYARD_ROOT}/generators/protoacc/software/verilator-bench"
 make gen       # .proto + .inc → gen/bench<N>_{descriptors.h,data.c}
 make bench     # just the 12 HPB ELFs (make alone → also tiny + repro)
 
 # Run one bench (LOADMEM=1 bypasses TSI loader, saves ~2 min/run).
-cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
+cd "${CHIPYARD_ROOT}/sims/verilator"
 BREAK_SIM_PREREQ=1 LOADMEM=1 make CONFIG=ProtoAccelRocketBaseConfig run-binary-fast \
-    BINARY=/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/build/bench1_ser.riscv
+    BINARY="${CHIPYARD_ROOT}/generators/protoacc/software/verilator-bench/build/bench1_ser.riscv"
 
 # Aggregate logs in the baseline output dir → benchmark_results.json.
-cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
+cd "${CHIPYARD_ROOT}/generators/protoacc/software/verilator-bench"
 python3 parse_results.py --output benchmark_results.json
 ```
 
@@ -180,8 +179,8 @@ Output logs land in `sims/verilator/output/chipyard.harness.TestHarness.ProtoAcc
 **Full HW-parameter sweep** (produces the ML training CSV):
 
 ```bash
-source /home/ec2-user/hyperscale-grpc-chipyard/env.sh
-cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
+source "${CHIPYARD_ROOT}/env.sh"
+cd "${CHIPYARD_ROOT}/generators/protoacc/software/verilator-bench"
 make gen && make bench
 
 # Emit N random samples per side into ProtoAccelSweepConfigs.scala.
@@ -209,7 +208,7 @@ physically separated from the cpp_obj. The current generator does this — see
 the `_STRING_HEADERS` and `_STRING_PAYLOADS` arrays. Don't collapse them back
 into the instance buffer without re-reproducing the failure.
 
-Full details: [project_hpb_ser_multifield_bug.md](/home/ec2-user/.claude/projects/-home-ec2-user/memory/project_hpb_ser_multifield_bug.md).
+Full details were tracked in project-specific notes (packed-buffer string layout vs serializer); reproduce with `bench_repro_c11`/`c13`/`c14` above.
 
 ### ProtoAccelRocketDebugConfig printfs don't fire on Verilator
 `WithProtoAccelPrintf` only affects `SynthesizePrintf` (FireSim synthesis wrappers);
@@ -255,7 +254,7 @@ a first pass, worth revisiting later.
 Because we can't feasibly match HPB's full byte-size scale under Verilator,
 the Lynx analytical model's feature extractor has been patched to honor the
 same caps so its output aligns with what the bench measures. See the
-`WorkloadProfile` in [/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py](/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py):
+`WorkloadProfile` in [../lynx/analytical_model/protobuf_analyzer.py](../lynx/analytical_model/protobuf_analyzer.py):
 
 - `skip_repeated = True` — treat repeated fields as absent in feature sizes.
 - `max_string_len = 1024` — cap every string/bytes payload to 1 KB.
@@ -265,7 +264,7 @@ Invoke `python3 protobuf_analyzer.py --verilator-bench-profile` to produce
 `protobuf_analysis_verilator_bench.json`, then
 `python3 extract_features.py --input protobuf_analysis_verilator_bench.json`
 to emit `extracted_features.json`. The canonical
-`/home/ec2-user/lynx/analytical_model/extracted_features.json` is the bench-
+`../lynx/analytical_model/extracted_features.json` is the bench-
 scoped one; `extracted_features_full.json` is the unconstrained reference.
 
 ## Next steps (prioritized)
@@ -277,7 +276,7 @@ The sweep harness is now in-tree:
 sample configs and [run_sweep.sh](run_sweep.sh) drives Verilator builds +
 bench runs in parallel, one row per `(config, bench, op)` in the output
 CSV. Downstream joining with analytical features happens in
-[/home/ec2-user/lynx/build_training_dataset.py](/home/ec2-user/lynx/build_training_dataset.py).
+[../lynx/build_training_dataset.py](../lynx/build_training_dataset.py).
 
 ### 2. Raise per-bench iteration count (easy lever)
 `ITERS=4` undercounts steady-state behavior because each bench includes a
@@ -302,7 +301,7 @@ Serializer is 23–33 Gb/s at 1.84 GHz on bench0/1/3/4 — paper reports
 
 ### 4. Workload fidelity: repeated fields
 About 3% of HPB fields (71 out of 2578). Biggest impact on bench2 (42 fields).
-Hardware layout (from [fieldhandler.scala:580-670](/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/src/main/scala/fieldhandler.scala#L580)):
+Hardware layout (from [fieldhandler.scala:580-670](../../src/main/scala/fieldhandler.scala#L580)):
 - For repeated scalars: cpp_obj slot holds address of a `RepeatedField<T>`
   struct `{T* elements_, int current_size_, int total_size_}` (24 B).
   Serializer reads `src-8` → `elements_*`, `src` → `{current_size_, total_size_}`.
@@ -315,7 +314,7 @@ repeated field. Runtime changes: `fixup_repeated()` analogous to
 
 ### 3. Repeated-field support
 - About 3% of HPB fields (71 out of 2578). Biggest impact on bench2 (42 fields).
-- Hardware layout (from [fieldhandler.scala:580-670](/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/src/main/scala/fieldhandler.scala#L580)):
+- Hardware layout (from [fieldhandler.scala:580-670](../../src/main/scala/fieldhandler.scala#L580)):
   - For repeated scalars: cpp_obj slot holds address of a `RepeatedField<T>`
     struct `{T* elements_, int current_size_, int total_size_}` (24 B).
     Serializer reads `src-8` → `elements_*`, `src` → `{current_size_, total_size_}`.
@@ -344,5 +343,5 @@ Probably needs iteration.
 3. [proto_to_accel.py](proto_to_accel.py) — the data model
 4. [bench_hpb_ser.c](bench_hpb_ser.c) — the runtime driver
 5. [run_sweep.sh](run_sweep.sh) + [gen_protoacc_sweep_configs.py](gen_protoacc_sweep_configs.py) — the sweep harness
-6. `~/.claude/projects/-home-ec2-user/memory/reference_protoacc_abi.md` — hardware ABI
-7. `~/.claude/projects/-home-ec2-user/memory/project_hpb_*.md` — the bug/feature memory notes
+6. ProtoAcc RTL sources under `generators/protoacc/src/main/scala/` — hardware ABI and datapath
+7. This file's **Known bugs** section — serializer/string-layout caveats and sweep notes

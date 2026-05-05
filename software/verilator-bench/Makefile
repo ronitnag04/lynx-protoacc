@@ -1,5 +1,5 @@
 # Bare-metal (HTIF) build for ProtoAcc Verilator benchmarks.
-# Run `source /home/ec2-user/hyperscale-grpc-chipyard/env.sh` first.
+# Source Chipyard env first: `source "$CHIPYARD_ROOT/env.sh"` (see README).
 #
 # Build artifacts go under build/. Pass BUILD=<dir> to override.
 
@@ -110,7 +110,9 @@ $(BUILD)/isolate_bench$(ISOLATE_BENCH)_m%.riscv: $(BUILD)/isolate_bench$(ISOLATE
 isolate: $(ISOLATE_ELFS)
 
 # Regenerate descriptor + data files from .proto sources.
-HPB_DIR ?= /home/ec2-user/lynx/HyperProtoBench
+VERILATOR_BENCH_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+LYNX_ROOT ?= $(abspath $(VERILATOR_BENCH_DIR)/../lynx)
+HPB_DIR ?= $(LYNX_ROOT)/HyperProtoBench
 gen: $(foreach b,0 1 2 3 4 5,gen/bench$(b)_descriptors.h gen/bench$(b)_data.c)
 
 gen/bench%_descriptors.h gen/bench%_data.c: $(HPB_DIR)/bench%/benchmark.proto proto_to_accel.py

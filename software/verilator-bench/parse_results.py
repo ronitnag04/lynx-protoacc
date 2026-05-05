@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -51,15 +52,24 @@ def parse_log(path: Path) -> Optional[Dict]:
     return last
 
 
+def _default_log_dir() -> Path:
+    root_env = os.environ.get("CHIPYARD_ROOT") or os.environ.get("CHIPYARD")
+    if root_env:
+        root = Path(root_env).expanduser().resolve()
+    else:
+        vb = Path(__file__).resolve().parent
+        root = vb.parent.parent.parent.parent
+    return root / "sims" / "verilator" / "output" / (
+        "chipyard.harness.TestHarness.ProtoAccelRocketBaseConfig"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--log-dir",
         type=Path,
-        default=Path(
-            "/home/ec2-user/hyperscale-grpc-chipyard/sims/verilator/output/"
-            "chipyard.harness.TestHarness.ProtoAccelRocketBaseConfig"
-        ),
+        default=_default_log_dir(),
         help="Directory containing bench*_ser.log / bench*_des.log files.",
     )
     ap.add_argument("--clock-hz", type=float, default=1e9)

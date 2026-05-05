@@ -4,3 +4,6 @@
 [submodule "firesim-workloads/hyperproto/HyperProtoBench"]
 	path = software/firesim-workloads/hyperproto/HyperProtoBench
 	url = https://github.com/abejgonzalez/hyperscale-grpc-hyperprotobench.git
+[submodule "software/lynx"]
+	path = software/lynx
+	url = git@github.com:ronitnag04/lynx.git

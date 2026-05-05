@@ -15,7 +15,9 @@
 
 set -euo pipefail
 
-CHIPYARD_ROOT=/home/ec2-user/hyperscale-grpc-chipyard
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Chipyard repo root: .../generators/protoacc/software/verilator-bench → ../../../../
+CHIPYARD_ROOT="${CHIPYARD_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
 SWEEP_SCALA="$CHIPYARD_ROOT/generators/chipyard/src/main/scala/config/ProtoAccelSweepConfigs.scala"
 VERILATOR_DIR="$CHIPYARD_ROOT/sims/verilator"
 VERILATOR_OUTPUT_ROOT="$VERILATOR_DIR/output"
