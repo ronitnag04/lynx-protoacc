@@ -10,6 +10,14 @@
 # a file lock, and (unless --keep-artifacts) deletes the per-config
 # generated-src tree + simulator binary to bound disk usage.
 #
+# By default the worker also zips and uploads the per-config build artifacts
+# and simulation outputs to S3 before local cleanup:
+#   generated-src + simulator   → s3://ronitnag04-lynx/verilator_build_files/<cls>.zip
+#   output/<cls>/                → s3://ronitnag04-lynx/simulation_files/<cls>.zip
+# This step is skipped (with a log line) if aws/zip are missing or if
+# --skip-upload is passed. Upload failures are non-fatal: they log and the
+# sweep continues.
+#
 # Usage (see --help):
 #   run_sweep.sh --output out.csv --side des --op des --workers 8
 
@@ -24,6 +32,21 @@ VERILATOR_OUTPUT_ROOT="$VERILATOR_DIR/output"
 VERILATOR_GENERATED_SRC_ROOT="$VERILATOR_DIR/generated-src"
 BENCH_BUILD_DIR="$CHIPYARD_ROOT/generators/protoacc/software/verilator-bench/build"
 CLASSPATH_JAR="$CHIPYARD_ROOT/.classpath_cache/chipyard.jar"
+
+# S3 destinations. Bucket/prefixes match what downstream Lynx training
+# scripts expect; change both sides if you re-home the artifacts. The
+# split bucket/prefix vars are there so the worker can use head-object
+# (which requires them individually) without re-parsing the URI each call.
+S3_BUCKET="ronitnag04-lynx"
+S3_BUILD_KEY_PREFIX="verilator_build_files"
+S3_SIM_KEY_PREFIX="simulation_files"
+S3_BUILD_PREFIX="s3://${S3_BUCKET}/${S3_BUILD_KEY_PREFIX}"
+S3_SIM_PREFIX="s3://${S3_BUCKET}/${S3_SIM_KEY_PREFIX}"
+
+# AWS CLI profile used for every upload call. Matches the [lynx] stanza in
+# ~/.aws/credentials, which is the team-scoped IAM user authorized to
+# write these buckets (the default profile is read-only on this account).
+AWS_PROFILE_NAME="${AWS_PROFILE_NAME:-lynx}"
 
 DEFAULT_BENCHES=(bench0 bench1 bench2 bench3 bench4 bench5)
 
@@ -84,6 +107,7 @@ Usage: $0 [options] --output OUT.csv
   --bench-timeout SEC         per-bench wall cap (default: 3600)
   --skip-build                don't build missing sims
   --keep-artifacts            don't delete generated-src/sim binary after use
+  --skip-upload               don't zip+upload per-config artifacts to S3
   --dry-run                   print plan and exit
 EOF
 }
@@ -98,6 +122,7 @@ WORKERS=$(nproc)
 BENCH_TIMEOUT=3600
 SKIP_BUILD=0
 KEEP_ARTIFACTS=0
+SKIP_UPLOAD=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -114,6 +139,7 @@ while [[ $# -gt 0 ]]; do
     --bench-timeout)  BENCH_TIMEOUT=$2; shift 2 ;;
     --skip-build)     SKIP_BUILD=1; shift ;;
     --keep-artifacts) KEEP_ARTIFACTS=1; shift ;;
+    --skip-upload)    SKIP_UPLOAD=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)                echo "unknown arg: $1" >&2; usage; exit 2 ;;
@@ -136,6 +162,19 @@ if ! command -v parallel >/dev/null; then
   exit 1
 fi
 
+# S3 upload is optional: disable it automatically (with a warning) if the
+# required tools aren't on PATH. The worker still logs per-config upload
+# failures individually.
+if (( SKIP_UPLOAD == 0 )); then
+  if ! command -v zip >/dev/null; then
+    echo "[upload] 'zip' not on PATH; disabling uploads." >&2
+    SKIP_UPLOAD=1
+  elif ! command -v aws >/dev/null; then
+    echo "[upload] 'aws' CLI not on PATH; disabling uploads." >&2
+    SKIP_UPLOAD=1
+  fi
+fi
+
 # Serialize the sbt assembly step. With multiple workers each discovering a
 # stale chipyard.jar, concurrent `sbt assembly` invocations overwrite the jar
 # mid-read in the downstream `java -cp ... chipyard.Generator` call, producing
@@ -148,8 +187,50 @@ make -C "$VERILATOR_DIR" CONFIG=ProtoAccelRocketConfig "$CLASSPATH_JAR" >/dev/nu
 # (cls, side, short=N short=N ...). awk collapses the /** Sweep row ... */
 # comment and the following `class` declaration into one record.
 PLAN_FILE=$(mktemp -t protoacc_sweep.XXXXXX)
-trap 'rm -f "$PLAN_FILE" "$PLAN_FILE".tmp' EXIT
 
+# On Ctrl+C / SIGTERM, tear down every descendant before exiting. Without this
+# the subprocess tree outlives the script: parallel only signals its direct
+# jobs (the worker bash shells); `make` keeps running its recipe until the
+# current cc1plus/verilator/java returns, and sbt-launched JVMs ignore
+# SIGTERM for many seconds. Walk the pid tree with pgrep -P and escalate
+# TERM → KILL so nothing is left orphaned.
+DESCENDANTS=()
+_collect_descendants() {
+  local parent=$1 c
+  for c in $(pgrep -P "$parent" 2>/dev/null); do
+    DESCENDANTS+=("$c")
+    _collect_descendants "$c"
+  done
+}
+kill_tree() {
+  local sig=$1
+  DESCENDANTS=()
+  _collect_descendants $$
+  if (( ${#DESCENDANTS[@]} > 0 )); then
+    kill -"$sig" "${DESCENDANTS[@]}" 2>/dev/null || true
+  fi
+}
+cleanup_tmp() { rm -f "$PLAN_FILE" "$PLAN_FILE".tmp 2>/dev/null || true; }
+on_interrupt() {
+  trap '' INT TERM  # ignore further signals while we tear down
+  echo "" >&2
+  echo "[abort] interrupt received — terminating sweep subprocesses..." >&2
+  kill_tree TERM
+  sleep 2
+  kill_tree KILL
+  cleanup_tmp
+  exit 130
+}
+trap on_interrupt INT TERM
+trap cleanup_tmp EXIT
+
+# Class-name scheme emitted by gen_protoacc_sweep_configs.py (updated):
+#   ProtoAccelDesSweep<AcronymValuePairs>Config         e.g. ...SweepDC4DDL2...Config
+#   ProtoAccelSerSweep<AcronymValuePairs>Config
+#   ProtoAccelSweep<AcronymValuePairs>Config             (joint)
+#   ProtoAcc{Des,Ser,}SweepDebug<AcronymValuePairs>Config (with --debug)
+# Side is determined by the prefix; debug variants reuse the preceding
+# non-debug row's parameter list.
 gawk -v side_filter="$SIDE" '
   /\/\*\* Sweep row/ {
     # strip the /** ... */ wrapper, keep "ShortLabel=N, ShortLabel=N, ..."
@@ -159,15 +240,17 @@ gawk -v side_filter="$SIDE" '
     gsub(/,/, " ", params)
     next
   }
-  /^class Proto.*SweepSample[0-9]+Config/ {
-    if (match($0, /class (Proto[A-Za-z]+SweepSample[0-9]+Config)/, a)) {
+  /^class ProtoAccel[A-Za-z0-9]*Sweep[A-Za-z0-9]+Config/ {
+    if (match($0, /class (ProtoAccel[A-Za-z0-9]*Sweep[A-Za-z0-9]+Config)/, a)) {
       cls = a[1]
-      side = (cls ~ /DesSweepSample/) ? "des" :
-             (cls ~ /SerSweepSample/) ? "ser" : "joint"
+      side = (cls ~ /DesSweep/) ? "des" :
+             (cls ~ /SerSweep/) ? "ser" : "joint"
       if (side_filter == "both" || side == side_filter) {
         printf "%s\t%s\t%s\n", cls, side, params
       }
-      params = ""
+      # intentionally do NOT reset params — a /** Debug printf variant of ... */
+      # class immediately follows its non-debug sibling and should inherit its
+      # parameter list.
     }
   }
 ' "$SWEEP_SCALA" > "$PLAN_FILE"
@@ -178,7 +261,7 @@ if (( LIMIT > 0 )); then
 fi
 
 TOTAL_CONFIGS=$(wc -l < "$PLAN_FILE")
-(( TOTAL_CONFIGS == 0 )) && { echo "No sweep-sample classes found." >&2; exit 1; }
+(( TOTAL_CONFIGS == 0 )) && { echo "No ProtoAccel*Sweep*Config classes found." >&2; exit 1; }
 
 echo "Sweep plan: $TOTAL_CONFIGS configs × ${#BENCHES[@]} bench(es) × op=$OP" >&2
 
@@ -200,6 +283,7 @@ if [[ ! -f "$OUTPUT" ]]; then echo "$CSV_HEADER" > "$OUTPUT"; fi
 # Export state the worker needs (parallel spawns fresh shells per job).
 export CHIPYARD_ROOT VERILATOR_DIR VERILATOR_OUTPUT_ROOT VERILATOR_GENERATED_SRC_ROOT
 export BENCH_BUILD_DIR OUTPUT OP JOBS BENCH_TIMEOUT SKIP_BUILD KEEP_ARTIFACTS
+export SKIP_UPLOAD S3_BUCKET S3_BUILD_KEY_PREFIX S3_SIM_KEY_PREFIX S3_BUILD_PREFIX S3_SIM_PREFIX AWS_PROFILE_NAME
 export BENCHES_STR="${BENCHES[*]}"
 export PARAM_KEYS_STR="${PARAM_KEYS[*]}"
 export DEFAULTS_STR
@@ -264,6 +348,9 @@ worker() {
   done
   if (( ${#pending[@]} == 0 )); then
     echo "[skip-done] $cls" >&2
+    # Still try to upload: a prior run may have produced CSV rows but
+    # crashed before uploading, and head-object makes this idempotent.
+    upload_artifacts "$cls"
     maybe_cleanup "$cls"
     return 0
   fi
@@ -358,7 +445,123 @@ worker() {
     echo "[done]     $cls × ${bench}_${op}: ${wall}s, ${bytes}B / ${cycles}cyc" >&2
   done
 
+  upload_artifacts "$cls"
   maybe_cleanup "$cls"
+}
+
+# Zip build artifacts (generated-src + simulator binary) and simulation
+# output, then upload each zip to its S3 prefix. Idempotent: a pre-existing
+# object at the destination key is left alone (the sweep is resume-friendly
+# and we don't want to re-upload identical builds). Any failure only logs;
+# it doesn't abort the worker, since losing an upload shouldn't void the
+# CSV row we just committed.
+upload_artifacts() {
+  (( SKIP_UPLOAD == 1 )) && return 0
+  local cls=$1
+  local gen_src="$VERILATOR_GENERATED_SRC_ROOT/chipyard.harness.TestHarness.$cls"
+  local sim_bin="$VERILATOR_DIR/simulator-chipyard.harness-$cls"
+  local sim_bin_debug="$VERILATOR_DIR/simulator-chipyard.harness-$cls.debug"
+  local sim_out="$VERILATOR_OUTPUT_ROOT/chipyard.harness.TestHarness.$cls"
+
+  _s3_upload_build "$cls" "$gen_src" "$sim_bin" "$sim_bin_debug"
+  _s3_upload_sim   "$cls" "$sim_out"
+}
+
+# $1 cls, $2 generated-src dir, $3 sim bin, $4 sim bin (debug variant)
+_s3_upload_build() {
+  local cls=$1 gen_src=$2 sim_bin=$3 sim_bin_debug=$4
+  local key="$S3_BUILD_KEY_PREFIX/$cls.zip"
+
+  # Need at least one of the artifacts to exist. If neither does, this is
+  # almost certainly a resumed sweep where --keep-artifacts wasn't set on
+  # the prior run — nothing to do.
+  if [[ ! -d $gen_src && ! -x $sim_bin && ! -f $sim_bin_debug ]]; then
+    return 0
+  fi
+
+  if aws --profile "$AWS_PROFILE_NAME" s3api head-object \
+      --bucket "$S3_BUCKET" --key "$key" >/dev/null 2>&1; then
+    echo "[upload-skip] $S3_BUILD_PREFIX/$cls.zip already exists" >&2
+    return 0
+  fi
+
+  local zip_tmp
+  zip_tmp=$(mktemp -t "build_${cls}.XXXXXX.zip")
+  rm -f "$zip_tmp"  # zip wants to create, not append
+  local zip_log
+  zip_log=$(mktemp -t "build_${cls}.XXXXXX.ziplog")
+
+  # Run zip from a stable cwd so archive paths are predictable (relative to
+  # $VERILATOR_DIR).
+  local -a zip_inputs=()
+  [[ -d $gen_src       ]] && zip_inputs+=("generated-src/chipyard.harness.TestHarness.$cls")
+  [[ -x $sim_bin       ]] && zip_inputs+=("simulator-chipyard.harness-$cls")
+  [[ -f $sim_bin_debug ]] && zip_inputs+=("simulator-chipyard.harness-$cls.debug")
+
+  if (( ${#zip_inputs[@]} == 0 )); then
+    rm -f "$zip_tmp" "$zip_log"
+    return 0
+  fi
+
+  if ! (cd "$VERILATOR_DIR" && zip -r -q "$zip_tmp" "${zip_inputs[@]}") \
+      >"$zip_log" 2>&1; then
+    echo "[upload-fail] $cls zip (build): see tail" >&2
+    tail -c 400 "$zip_log" >&2
+    rm -f "$zip_tmp" "$zip_log"
+    return 0
+  fi
+
+  if aws --profile "$AWS_PROFILE_NAME" s3 cp --only-show-errors \
+      "$zip_tmp" "$S3_BUILD_PREFIX/$cls.zip" >"$zip_log" 2>&1; then
+    local sz
+    sz=$(stat -c %s "$zip_tmp" 2>/dev/null || echo ?)
+    echo "[upload-ok] $S3_BUILD_PREFIX/$cls.zip (${sz}B)" >&2
+  else
+    echo "[upload-fail] $S3_BUILD_PREFIX/$cls.zip: see tail" >&2
+    tail -c 400 "$zip_log" >&2
+  fi
+  rm -f "$zip_tmp" "$zip_log"
+}
+
+# $1 cls, $2 output dir
+_s3_upload_sim() {
+  local cls=$1 sim_out=$2
+  local key="$S3_SIM_KEY_PREFIX/$cls.zip"
+
+  if [[ ! -d $sim_out ]]; then
+    return 0
+  fi
+
+  if aws --profile "$AWS_PROFILE_NAME" s3api head-object \
+      --bucket "$S3_BUCKET" --key "$key" >/dev/null 2>&1; then
+    echo "[upload-skip] $S3_SIM_PREFIX/$cls.zip already exists" >&2
+    return 0
+  fi
+
+  local zip_tmp zip_log
+  zip_tmp=$(mktemp -t "sim_${cls}.XXXXXX.zip")
+  rm -f "$zip_tmp"
+  zip_log=$(mktemp -t "sim_${cls}.XXXXXX.ziplog")
+
+  if ! (cd "$VERILATOR_OUTPUT_ROOT" && \
+        zip -r -q "$zip_tmp" "chipyard.harness.TestHarness.$cls") \
+      >"$zip_log" 2>&1; then
+    echo "[upload-fail] $cls zip (sim): see tail" >&2
+    tail -c 400 "$zip_log" >&2
+    rm -f "$zip_tmp" "$zip_log"
+    return 0
+  fi
+
+  if aws --profile "$AWS_PROFILE_NAME" s3 cp --only-show-errors \
+      "$zip_tmp" "$S3_SIM_PREFIX/$cls.zip" >"$zip_log" 2>&1; then
+    local sz
+    sz=$(stat -c %s "$zip_tmp" 2>/dev/null || echo ?)
+    echo "[upload-ok] $S3_SIM_PREFIX/$cls.zip (${sz}B)" >&2
+  else
+    echo "[upload-fail] $S3_SIM_PREFIX/$cls.zip: see tail" >&2
+    tail -c 400 "$zip_log" >&2
+  fi
+  rm -f "$zip_tmp" "$zip_log"
 }
 
 maybe_cleanup() {
@@ -370,9 +573,11 @@ maybe_cleanup() {
   echo "[cleanup]  $cls" >&2
 }
 
-export -f worker maybe_cleanup
+export -f worker upload_artifacts _s3_upload_build _s3_upload_sim maybe_cleanup
 
 echo "[parallel] $WORKERS workers, make -j$JOBS per build" >&2
-parallel -j "$WORKERS" --line-buffer --halt soon,fail=1 worker :::: "$PLAN_FILE"
+parallel -j "$WORKERS" --line-buffer --halt soon,fail=1 \
+  --termseq INT,1000,TERM,2000,KILL,25 \
+  worker :::: "$PLAN_FILE"
 
 echo "Wrote $OUTPUT" >&2

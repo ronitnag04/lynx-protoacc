@@ -10,8 +10,11 @@ RoCC accelerator under Chipyard's Verilator simulator. Outputs:
   Verilator config, via [parse_results.py](parse_results.py)).
 - Per-`(config, bench, op)` training rows for the Lynx ML throughput model,
   via [run_sweep.sh](run_sweep.sh) iterating the
-  `ProtoAccelDesSweepSample*` / `ProtoAccelSerSweepSample*` configs emitted
-  by [gen_protoacc_sweep_configs.py](gen_protoacc_sweep_configs.py).
+  `ProtoAccelDesSweep<acronyms>Config` / `ProtoAccelSerSweep<acronyms>Config`
+  classes emitted by [gen_protoacc_sweep_configs.py](gen_protoacc_sweep_configs.py).
+  Class names encode only the active side's parameter values (via the
+  `DES_ACRONYM_LABEL_BY_KEY` / `SER_ACRONYM_LABEL_BY_KEY` tables) so des-only
+  and ser-only sweep CSVs are safe to merge on `config_name`.
 
 ## Goal
 

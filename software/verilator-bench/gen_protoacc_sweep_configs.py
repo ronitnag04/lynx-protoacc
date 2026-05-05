@@ -14,12 +14,23 @@ Sweep types (``-t`` / ``--sweep-type``):
 
 Emit modes (``--emit``):
 - both (default): ``ProtoAccelDesSweepConfigs`` + ``ProtoAccelSerSweepConfigs``
-  with classes ``ProtoAccelDesSweepSample*`` / ``ProtoAccelSerSweepSample*``.
+  with descriptive classes ``ProtoAccelDesSweep{ACRONYM+VALUE}*Config`` /
+  ``ProtoAccelSerSweep{ACRONYM+VALUE}*Config``. Each class name encodes only
+  the **active** side's parameter values (inactive side stays at defaults) so
+  CSV rows from different sweeps can be deduped/merged on ``config_name``.
   Serializer parameters vary only in the ser block; deserializer only in the
   des block. ``-n`` applies **per side** for random sweeps.
 - des / ser: emit only that side's object + classes.
-- joint: legacy single object ``ProtoAccelSweepConfigs`` + ``ProtoAccelSweepSample*``
-  varying all axes together (old joint space).
+- joint: legacy single object ``ProtoAccelSweepConfigs`` + ``ProtoAccelSweep*``
+  classes encoding **all** params in the name, varying all axes together.
+
+Class-name encoding uses the acronym tables (``DES_ACRONYM_LABEL_BY_KEY`` /
+``SER_ACRONYM_LABEL_BY_KEY``). Example: a des-side sample with
+``des_cr_rocc_commands=4``, ``des_dth_fd_reqs=4``, ... ends up as
+``ProtoAccelDesSweepDC4DDFQ4DDFP2DDL4DFL4DMB16DML256DTD4DTM64Config``.
+Debug (``--debug``) variants get a ``Debug`` infix after the side tag, e.g.
+``ProtoAccelDesSweepDebugDC4...Config``. Colliding combos (common under
+``-t ofat`` where every axis re-emits the defaults row) are deduplicated.
 
 Mixed-radix axis order within a side is sorted keys for that side
 (``des_*`` then ``ser_*`` when combined for fragment emission order).
@@ -33,7 +44,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import math
+import csv
 import random
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence, Tuple
@@ -49,6 +60,7 @@ DEFAULT_OUT = (
     / "config"
     / "ProtoAccelSweepConfigs.scala"
 )
+DEFAULT_CSV_OUT = SCRIPT_DIR / "sweep_configs.csv"
 
 # --- Deserializer queue / depth parameters (``des_*`` keys) -----------------
 
@@ -98,6 +110,18 @@ DES_SHORT_LABEL_BY_KEY: Dict[str, str] = {
     "des_fw_l1_reqs": "DesFwL1",
     "des_ml_buf_info_q": "DesMlBufInfo",
     "des_ml_load_info_q": "DesMlLoadInfo",
+}
+
+DES_ACRONYM_LABEL_BY_KEY: Dict[str, str] = {
+    "des_top_descriptor_reqs": "DTD",
+    "des_top_memloader_reqs": "DTM",
+    "des_cr_rocc_commands": "DC",
+    "des_dth_l1_reqs": "DDL",
+    "des_dth_fd_reqs": "DDFQ",
+    "des_dth_fd_resps": "DDFP",
+    "des_fw_l1_reqs": "DFL",
+    "des_ml_buf_info_q": "DMB",
+    "des_ml_load_info_q": "DML",
 }
 
 # --- Serializer queue / depth parameters (``ser_*`` keys) ---------------------
@@ -154,15 +178,37 @@ SER_SHORT_LABEL_BY_KEY: Dict[str, str] = {
     "ser_mw_write_ptrs": "SerMwWritePtrs",
 }
 
+SER_ACRONYM_LABEL_BY_KEY: Dict[str, str] = {
+    "ser_field_handlers": "SF",
+    "ser_cr_rocc_commands": "SC",
+    "ser_dth_hasbits_reqs": "SDH",
+    "ser_dth_descriptor_reqs": "SDD",
+    "ser_dth_reg_resps": "SDQ",
+    "ser_dth_reqs_meta": "SDM",
+    "ser_dth_fh_outputs": "SDF",
+    "ser_mw_write_input": "SMI",
+    "ser_mw_write_inject": "SMJ",
+    "ser_mw_write_ptrs": "SMP",
+}
+
 # Merged tables (must match generators/protoacc/src/main/scala/util.scala defaults).
 PARAM_VALUES: Dict[str, List[int]] = {**DES_PARAM_VALUES, **SER_PARAM_VALUES}
 DEFAULT_PARAM_VALUES: Dict[str, int] = {**DES_DEFAULT_PARAM_VALUES, **SER_DEFAULT_PARAM_VALUES}
 WITH_CLASS_BY_KEY: Dict[str, str] = {**DES_WITH_CLASS_BY_KEY, **SER_WITH_CLASS_BY_KEY}
 SHORT_LABEL_BY_KEY: Dict[str, str] = {**DES_SHORT_LABEL_BY_KEY, **SER_SHORT_LABEL_BY_KEY}
+ACRONYM_LABEL_BY_KEY: Dict[str, str] = {**DES_ACRONYM_LABEL_BY_KEY, **SER_ACRONYM_LABEL_BY_KEY}
 
 DES_KEYS: Tuple[str, ...] = tuple(sorted(DES_PARAM_VALUES.keys()))
 SER_KEYS: Tuple[str, ...] = tuple(sorted(SER_PARAM_VALUES.keys()))
 FULL_PARAM_KEYS: Tuple[str, ...] = tuple(sorted(PARAM_VALUES.keys()))
+
+# Canonical column order used by run_sweep.sh's sweep.csv: des_* (dict order
+# as listed in DES_PARAM_VALUES) then ser_*. Kept separate from DES_KEYS /
+# SER_KEYS (which are sorted) so CSV joins on config_name remain compatible.
+CSV_PARAM_KEYS: Tuple[str, ...] = (
+    tuple(DES_PARAM_VALUES.keys()) + tuple(SER_PARAM_VALUES.keys())
+)
+CSV_COLUMNS: Tuple[str, ...] = ("config_name", "side") + CSV_PARAM_KEYS
 
 _MAX_INDICES_MATERIALIZE = 10**9
 
@@ -199,9 +245,18 @@ def _validate_tables() -> None:
     if merged_defaults != DEFAULT_PARAM_VALUES:
         raise SystemExit("DEFAULT_PARAM_VALUES must merge DES and SER defaults")
 
-    for label, d in (("WITH_CLASS_BY_KEY", WITH_CLASS_BY_KEY), ("SHORT_LABEL_BY_KEY", SHORT_LABEL_BY_KEY)):
+    for label, d in (
+        ("WITH_CLASS_BY_KEY", WITH_CLASS_BY_KEY),
+        ("SHORT_LABEL_BY_KEY", SHORT_LABEL_BY_KEY),
+        ("ACRONYM_LABEL_BY_KEY", ACRONYM_LABEL_BY_KEY),
+    ):
         if set(d) != set(PARAM_VALUES):
             raise SystemExit(f"{label} keys must match PARAM_VALUES")
+
+    acronyms = list(ACRONYM_LABEL_BY_KEY.values())
+    if len(set(acronyms)) != len(acronyms):
+        dupes = [a for a in acronyms if acronyms.count(a) > 1]
+        raise SystemExit(f"ACRONYM_LABEL_BY_KEY has duplicate acronyms: {sorted(set(dupes))!r}")
 
 
 def first_non_default_value(
@@ -249,25 +304,29 @@ def index_to_combination(
     return dict(zip(keys, [value_lists[i][d] for i, d in enumerate(digits)]))
 
 
-def sample_random_indices(total: int, n: int) -> List[int]:
+def sample_random_indices(total: int, n: int, offset: int = 0) -> List[int]:
     """
-    Return n distinct random indices in [0, total) without materializing range(total).
+    Return ``n`` distinct random indices in ``[0, total)`` without materializing
+    ``range(total)``. When ``offset > 0``, draws ``offset + n`` distinct indices
+    using the current RNG state and returns only the tail (the last ``n``). That
+    way, two machines with the same seed but different offsets ``(0, n)`` and
+    ``(n, n)`` produce disjoint samples that together equal the ``2n``-sample
+    from offset ``0``.
     """
-    if n >= total:
-        if total <= _MAX_INDICES_MATERIALIZE:
-            return list(range(total))
+    draw = offset + n
+    if draw > total:
         raise SystemExit(
-            f"Total combinations ({total}) is very large; "
-            "num_configs must be less than total (use -n to sample a subset)."
+            f"offset({offset}) + num_configs({n}) = {draw} exceeds total "
+            f"combinations ({total})."
         )
     chosen: List[int] = []
     seen: set[int] = set()
-    while len(chosen) < n:
+    while len(chosen) < draw:
         idx = random.randrange(total)
         if idx not in seen:
             seen.add(idx)
             chosen.append(idx)
-    return chosen
+    return chosen[offset:]
 
 
 def merge_full_combo(partial: Mapping[str, int]) -> Dict[str, int]:
@@ -294,8 +353,14 @@ def build_combinations(
     num_configs: int,
     seed: int,
     active_keys: Sequence[str],
+    offset: int = 0,
 ) -> Tuple[List[Dict[str, int]], str]:
-    """Return (list of **full** combo dicts, human-readable summary line)."""
+    """Return (list of **full** combo dicts, human-readable summary line).
+
+    For random sweeps, ``offset`` skips the first ``offset`` samples from the
+    seeded draw, letting one machine emit indices [0, N) and another [N, 2N)
+    with guaranteed non-overlap under the same seed.
+    """
     slice_pv = {k: PARAM_VALUES[k] for k in active_keys}
     side = "joint" if len(active_keys) == len(FULL_PARAM_KEYS) else (
         "deserializer" if set(active_keys) <= set(DES_KEYS) else (
@@ -306,20 +371,24 @@ def build_combinations(
     if sweep_type == "random":
         random.seed(seed)
         total = total_combinations(slice_pv, active_keys)
-        n = min(num_configs, total)
+        if offset < 0:
+            raise SystemExit(f"--offset must be >= 0 (got {offset}).")
+        if offset + num_configs > total:
+            raise SystemExit(
+                f"[{side}] offset({offset}) + num_configs({num_configs}) = "
+                f"{offset + num_configs} exceeds total combinations ({total})."
+            )
+        n = num_configs
         summary = (
             f"[{side}] Total combinations on active axes: {total:.2e}. "
-            f"Sampling {n} random indices (seed={seed})."
+            f"Sampling {n} random indices (seed={seed}, offset={offset})."
         )
-        if n >= total:
-            if total > _MAX_INDICES_MATERIALIZE:
-                raise SystemExit(
-                    f"Active space has {total} combinations (> {_MAX_INDICES_MATERIALIZE}); "
-                    "cannot enumerate. Use -n < total to sample."
-                )
-            random_indices = list(range(total))
-        else:
-            random_indices = sample_random_indices(total, n)
+        if total > _MAX_INDICES_MATERIALIZE and offset + n >= total:
+            raise SystemExit(
+                f"Active space has {total} combinations (> {_MAX_INDICES_MATERIALIZE}); "
+                "cannot enumerate. Use offset + n < total to sample."
+            )
+        random_indices = sample_random_indices(total, n, offset=offset)
         sizes, strides = _compute_strides(slice_pv, active_keys)
         combinations = [
             merge_full_combo(
@@ -379,20 +448,56 @@ def build_combinations(
     raise SystemExit(f"Unknown sweep type: {sweep_type}")
 
 
+def _encode_combo_name(
+    combo: Mapping[str, int], name_keys: Sequence[str]
+) -> str:
+    """Return the acronym+value encoding for `combo` over `name_keys`."""
+    return "".join(f"{ACRONYM_LABEL_BY_KEY[k]}{combo[k]}" for k in name_keys)
+
+
+def _class_basename(
+    *,
+    class_prefix: str,
+    class_debug_prefix: str,
+    name_keys: Sequence[str],
+    combo: Mapping[str, int],
+    debug: bool,
+) -> str:
+    prefix = class_debug_prefix if debug else class_prefix
+    return f"{prefix}{_encode_combo_name(combo, name_keys)}Config"
+
+
+def _dedupe_by_name(
+    combinations: Sequence[Mapping[str, int]], name_keys: Sequence[str]
+) -> List[Dict[str, int]]:
+    """Drop combos whose name-key projection was already seen earlier."""
+    seen: set[Tuple[int, ...]] = set()
+    out: List[Dict[str, int]] = []
+    for combo in combinations:
+        sig = tuple(combo[k] for k in name_keys)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(dict(combo))
+    return out
+
+
 def _emit_side_block(
     *,
     lines: List[str],
     object_name: str,
-    sample_prefix: str,
-    debug_sample_prefix: str,
+    class_prefix: str,
+    class_debug_prefix: str,
+    name_keys: Sequence[str],
     combinations: Sequence[Mapping[str, int]],
     sweep_type: str,
     seed: int,
     num_configs_requested: int,
     generate_debug: bool,
-) -> None:
-    n = len(combinations)
-    idx_width = max(3, int(math.ceil(math.log10(max(n, 10)))))
+) -> int:
+    """Emit one ``object`` + Scala classes. Returns the emitted row count (post-dedupe)."""
+    combos = _dedupe_by_name(combinations, name_keys)
+    n = len(combos)
 
     lines.append(f"object {object_name} {{")
     lines.append("")
@@ -403,8 +508,14 @@ def _emit_side_block(
     lines.append("")
     lines.append("  /** CONFIG= names for non-debug generated classes (basename only). */")
     lines.append("  val normalSweepConfigNames: Seq[String] = Seq(")
-    for i in range(n):
-        name = f"{sample_prefix}{i:0{idx_width}d}Config"
+    for combo in combos:
+        name = _class_basename(
+            class_prefix=class_prefix,
+            class_debug_prefix=class_debug_prefix,
+            name_keys=name_keys,
+            combo=combo,
+            debug=False,
+        )
         lines.append(f'    "{name}",')
     lines.append("  )")
 
@@ -414,8 +525,14 @@ def _emit_side_block(
             "  /** CONFIG= names for debug (printf) variants. */",
             "  val debugSweepConfigNames: Seq[String] = Seq(",
         ]
-        for i in range(n):
-            dname = f"{debug_sample_prefix}{i:0{idx_width}d}Config"
+        for combo in combos:
+            dname = _class_basename(
+                class_prefix=class_prefix,
+                class_debug_prefix=class_debug_prefix,
+                name_keys=name_keys,
+                combo=combo,
+                debug=True,
+            )
             lines.append(f'    "{dname}",')
         lines.append("  )")
     else:
@@ -428,9 +545,15 @@ def _emit_side_block(
     lines.append("}")
     lines.append("")
 
-    for i, combo in enumerate(combinations):
+    for i, combo in enumerate(combos):
         cmt = _combo_comment(combo)
-        name = f"{sample_prefix}{i:0{idx_width}d}Config"
+        name = _class_basename(
+            class_prefix=class_prefix,
+            class_debug_prefix=class_debug_prefix,
+            name_keys=name_keys,
+            combo=combo,
+            debug=False,
+        )
         lines.append(f"/** Sweep row {i + 1}/{n} ({sweep_type}): {cmt} */")
         lines.append(f"class {name} extends Config(")
         lines.append(_scala_fragments(combo))
@@ -438,13 +561,65 @@ def _emit_side_block(
         lines.append("")
 
         if generate_debug:
-            dname = f"{debug_sample_prefix}{i:0{idx_width}d}Config"
+            dname = _class_basename(
+                class_prefix=class_prefix,
+                class_debug_prefix=class_debug_prefix,
+                name_keys=name_keys,
+                combo=combo,
+                debug=True,
+            )
             lines.append(f"/** Debug printf variant of `{name}`. */")
             lines.append(f"class {dname} extends Config(")
             lines.append(DEBUG_PREFIX.rstrip("\n"))
             lines.append(_scala_fragments(combo))
             lines.append(BASE_FRAGMENTS)
             lines.append("")
+
+    return n
+
+
+def _csv_side_tag(name_keys: Sequence[str]) -> str:
+    if len(name_keys) == len(FULL_PARAM_KEYS):
+        return "joint"
+    if set(name_keys) <= set(DES_KEYS):
+        return "des"
+    if set(name_keys) <= set(SER_KEYS):
+        return "ser"
+    return "custom"
+
+
+def _combo_csv_row(
+    *,
+    class_prefix: str,
+    class_debug_prefix: str,
+    name_keys: Sequence[str],
+    combo: Mapping[str, int],
+    side_tag: str,
+) -> Dict[str, object]:
+    name = _class_basename(
+        class_prefix=class_prefix,
+        class_debug_prefix=class_debug_prefix,
+        name_keys=name_keys,
+        combo=combo,
+        debug=False,
+    )
+    row: Dict[str, object] = {"config_name": name, "side": side_tag}
+    for k in CSV_PARAM_KEYS:
+        row[k] = combo[k]
+    return row
+
+
+def write_configs_csv(
+    out_path: Path,
+    rows: Sequence[Mapping[str, object]],
+) -> None:
+    """Write a plain CSV of generated configs (no simulation data)."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(CSV_COLUMNS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def render_file_joint(
@@ -476,11 +651,12 @@ def render_file_joint(
         lines.append(f"// {s}")
     lines.append("")
 
-    _emit_side_block(
+    emitted = _emit_side_block(
         lines=lines,
         object_name="ProtoAccelSweepConfigs",
-        sample_prefix="ProtoAccelSweepSample",
-        debug_sample_prefix="ProtoAccelSweepDebugSample",
+        class_prefix="ProtoAccelSweep",
+        class_debug_prefix="ProtoAccelSweepDebug",
+        name_keys=FULL_PARAM_KEYS,
         combinations=combinations,
         sweep_type=sweep_type,
         seed=seed,
@@ -490,15 +666,16 @@ def render_file_joint(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    n = len(combinations)
-    total_classes = n * (2 if generate_debug else 1)
+    total_classes = emitted * (2 if generate_debug else 1)
     return total_classes
 
 
 def render_file_split(
     *,
     out_path: Path,
-    blocks: Sequence[Tuple[str, str, str, str, List[Dict[str, int]], str]],
+    blocks: Sequence[
+        Tuple[str, str, str, Tuple[str, ...], str, List[Dict[str, int]], int]
+    ],
     sweep_type: str,
     seed_des: int,
     seed_ser: int,
@@ -507,7 +684,8 @@ def render_file_split(
     summaries: Sequence[str],
 ) -> int:
     """
-    ``blocks``: (object_name, sample_prefix, debug_sample_prefix, side_label, combos, seed_for_block)
+    ``blocks``: (object_name, class_prefix, class_debug_prefix, name_keys,
+    side_label, combos, seed_for_block)
     """
     lines: List[str] = [
         "// GENERATED FILE — do not edit by hand.",
@@ -529,19 +707,20 @@ def render_file_split(
     lines.append("")
 
     total_classes = 0
-    for object_name, sample_pfx, debug_pfx, _label, combos, block_seed in blocks:
-        _emit_side_block(
+    for object_name, class_pfx, class_debug_pfx, name_keys, _label, combos, block_seed in blocks:
+        emitted = _emit_side_block(
             lines=lines,
             object_name=object_name,
-            sample_prefix=sample_pfx,
-            debug_sample_prefix=debug_pfx,
+            class_prefix=class_pfx,
+            class_debug_prefix=class_debug_pfx,
+            name_keys=name_keys,
             combinations=combos,
             sweep_type=sweep_type,
             seed=block_seed,
             num_configs_requested=num_configs_requested,
             generate_debug=generate_debug,
         )
-        total_classes += len(combos) * (2 if generate_debug else 1)
+        total_classes += emitted * (2 if generate_debug else 1)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -601,9 +780,30 @@ def main() -> None:
         help="Random seed for random sweeps (ser side uses seed+1000003 when --emit both).",
     )
     parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help=(
+            "For random sweeps: skip the first OFFSET samples from the seeded "
+            "draw. Lets two machines with the same seed produce disjoint "
+            "samples — e.g. one runs with -n N --offset 0, another with "
+            "-n N --offset N. Applied per side with --emit both. Ignored for "
+            "non-random sweep types."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Also emit WithProtoAccelPrintf twin for each config",
+    )
+    parser.add_argument(
+        "--csv-output",
+        type=Path,
+        default=DEFAULT_CSV_OUT,
+        help=(
+            f"CSV file listing the emitted configs (no simulation data). "
+            f"Default: {DEFAULT_CSV_OUT}"
+        ),
     )
     args = parser.parse_args()
 
@@ -613,9 +813,18 @@ def main() -> None:
     sweep_type = args.sweep_type
     n = args.num_configs
     seed = args.seed
+    offset = args.offset
+
+    if offset and sweep_type != "random":
+        print(
+            f"warning: --offset={offset} is ignored for sweep-type={sweep_type!r} "
+            "(only affects random sweeps)."
+        )
 
     if emit == "joint":
-        combos, summary = build_combinations(sweep_type, n, seed, FULL_PARAM_KEYS)
+        combos, summary = build_combinations(
+            sweep_type, n, seed, FULL_PARAM_KEYS, offset=offset
+        )
         summaries = [summary]
         total = render_file_joint(
             out_path=args.output,
@@ -626,36 +835,58 @@ def main() -> None:
             generate_debug=args.debug,
             summaries=summaries,
         )
+        deduped = _dedupe_by_name(combos, FULL_PARAM_KEYS)
+        csv_rows = [
+            _combo_csv_row(
+                class_prefix="ProtoAccelSweep",
+                class_debug_prefix="ProtoAccelSweepDebug",
+                name_keys=FULL_PARAM_KEYS,
+                combo=c,
+                side_tag=_csv_side_tag(FULL_PARAM_KEYS),
+            )
+            for c in deduped
+        ]
+        write_configs_csv(args.csv_output, csv_rows)
         print(summary)
-        print(f"Wrote {args.output} ({len(combos)} configs, {total} Scala classes)")
+        n_non_debug = total // (2 if args.debug else 1)
+        print(f"Wrote {args.output} ({n_non_debug} distinct configs, {total} Scala classes)")
+        print(f"Wrote {args.csv_output} ({len(csv_rows)} config rows)")
         return
 
     seed_des = seed
     seed_ser = seed + _SER_SEED_OFFSET
     summaries: List[str] = []
-    blocks: List[Tuple[str, str, str, str, List[Dict[str, int]], int]] = []
+    blocks: List[
+        Tuple[str, str, str, Tuple[str, ...], str, List[Dict[str, int]], int]
+    ] = []
 
     if emit in ("both", "des"):
-        c_des, s_des = build_combinations(sweep_type, n, seed_des, DES_KEYS)
+        c_des, s_des = build_combinations(
+            sweep_type, n, seed_des, DES_KEYS, offset=offset
+        )
         summaries.append(s_des)
         blocks.append(
             (
                 "ProtoAccelDesSweepConfigs",
-                "ProtoAccelDesSweepSample",
-                "ProtoAccelDesSweepDebugSample",
+                "ProtoAccelDesSweep",
+                "ProtoAccelDesSweepDebug",
+                DES_KEYS,
                 "deserializer",
                 c_des,
                 seed_des,
             )
         )
     if emit in ("both", "ser"):
-        c_ser, s_ser = build_combinations(sweep_type, n, seed_ser, SER_KEYS)
+        c_ser, s_ser = build_combinations(
+            sweep_type, n, seed_ser, SER_KEYS, offset=offset
+        )
         summaries.append(s_ser)
         blocks.append(
             (
                 "ProtoAccelSerSweepConfigs",
-                "ProtoAccelSerSweepSample",
-                "ProtoAccelSerSweepDebugSample",
+                "ProtoAccelSerSweep",
+                "ProtoAccelSerSweepDebug",
+                SER_KEYS,
                 "serializer",
                 c_ser,
                 seed_ser,
@@ -674,8 +905,29 @@ def main() -> None:
         generate_debug=args.debug,
         summaries=summaries,
     )
-    nrows = sum(len(b[4]) for b in blocks)
-    print(f"Wrote {args.output} ({nrows} configs across {len(blocks)} side block(s), {total} Scala classes)")
+
+    csv_rows: List[Dict[str, object]] = []
+    for object_name, class_pfx, class_debug_pfx, name_keys, _label, combos, _seed in blocks:
+        deduped = _dedupe_by_name(combos, name_keys)
+        side_tag = _csv_side_tag(name_keys)
+        for c in deduped:
+            csv_rows.append(
+                _combo_csv_row(
+                    class_prefix=class_pfx,
+                    class_debug_prefix=class_debug_pfx,
+                    name_keys=name_keys,
+                    combo=c,
+                    side_tag=side_tag,
+                )
+            )
+    write_configs_csv(args.csv_output, csv_rows)
+
+    n_non_debug = total // (2 if args.debug else 1)
+    print(
+        f"Wrote {args.output} ({n_non_debug} distinct configs across {len(blocks)} "
+        f"side block(s), {total} Scala classes)"
+    )
+    print(f"Wrote {args.csv_output} ({len(csv_rows)} config rows)")
 
 
 if __name__ == "__main__":

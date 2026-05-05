@@ -6,7 +6,12 @@ accelerator under Chipyard's Verilator simulator. Each bench ELF emits
 and iteration counts so throughput can be derived from the bench log.
 
 The per-config sweep driver ([run_sweep.sh](run_sweep.sh)) iterates every
-emitted `ProtoAccelDesSweepSample*Config` / `ProtoAccelSerSweepSample*Config`,
+emitted `ProtoAccelDesSweep{acronyms}Config` /
+`ProtoAccelSerSweep{acronyms}Config` class (the class name encodes every
+varied parameter as `<acronym><value>` pairs — see the
+`DES_ACRONYM_LABEL_BY_KEY` / `SER_ACRONYM_LABEL_BY_KEY` tables in
+`gen_protoacc_sweep_configs.py`; only the sweep's active side is encoded,
+so CSV rows from separate des/ser runs join cleanly on `config_name`),
 builds a Verilator simulator for each, runs all six HPB benches against it,
 appends one row per `(config, bench, op)` to a CSV, and reclaims the
 per-config `generated-src` tree + simulator binary between configs.
@@ -86,9 +91,18 @@ make clean       # wipe build/ and gen/
 ### 3. Emit sweep configs
 
 `gen_protoacc_sweep_configs.py` writes `ProtoAccelSweepConfigs.scala` into
-`generators/chipyard/src/main/scala/config/`, containing one
-`ProtoAccelDesSweepSampleNNNConfig` per deserializer-side sample and one
-`ProtoAccelSerSweepSampleNNNConfig` per serializer-side sample.
+`generators/chipyard/src/main/scala/config/`. Each emitted class name
+encodes the **active** side's parameter values as `<acronym><value>` pairs
+(acronyms come from `DES_ACRONYM_LABEL_BY_KEY` /
+`SER_ACRONYM_LABEL_BY_KEY`). For example, a des-side sample with
+`des_cr_rocc_commands=4, des_dth_fd_reqs=8, …` emits
+`ProtoAccelDesSweepDC4DDFQ8…Config`, and a ser-side sample with
+`ser_field_handlers=6, ser_cr_rocc_commands=4, …` emits
+`ProtoAccelSerSweepSF6SC4…Config`. Because the inactive side stays at
+defaults, two independent `--emit des` and `--emit ser` runs can be
+concatenated into one training CSV and joined on `config_name` without
+collision. Debug variants (`--debug`) get a `Debug` infix:
+`ProtoAccelDesSweepDebug…Config`.
 
 ```bash
 # 32 random samples per side (64 total configs), seed 42:
@@ -125,7 +139,12 @@ What this does per config, in parallel:
 3. Parse the last `ACCEL_SUMMARY:` line from
    `sims/verilator/output/chipyard.harness.TestHarness.<cls>/bench<N>_{op}.log`.
 4. Append one CSV row per bench under a file lock.
-5. Delete the per-config `generated-src` tree and simulator binary.
+5. Zip + upload the per-config artifacts to S3 (idempotent; skipped if the
+   object already exists or if `--skip-upload` / `zip` / `aws` are missing):
+   - `generated-src/chipyard.harness.TestHarness.<cls>` + `simulator-chipyard.harness-<cls>`
+     → `s3://ronitnag04-lynx/verilator_build_files/<cls>.zip`
+   - `output/chipyard.harness.TestHarness.<cls>/` → `s3://ronitnag04-lynx/simulation_files/<cls>.zip`
+6. Delete the per-config `generated-src` tree and simulator binary.
 
 Selected useful flags (see `bash run_sweep.sh --help`):
 
@@ -138,6 +157,7 @@ Selected useful flags (see `bash run_sweep.sh --help`):
 | `--workers N`        | Parallel configs (default: `nproc`).                         |
 | `--jobs N`           | `make -j` per Verilator build (default: 1).                  |
 | `--keep-artifacts`   | Skip cleanup, useful when debugging a single config.         |
+| `--skip-upload`      | Skip the per-config S3 upload (default: enabled).            |
 | `--dry-run`          | Print the plan without building.                             |
 
 **Resume**: re-running with the same `--output` skips any
