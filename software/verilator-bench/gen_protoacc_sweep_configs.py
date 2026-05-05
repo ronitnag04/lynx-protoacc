@@ -41,7 +41,7 @@ from typing import Dict, List, Mapping, Sequence, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUT = (
-    SCRIPT_DIR.parent.parent
+    SCRIPT_DIR.parent.parent.parent
     / "chipyard"
     / "src"
     / "main"
@@ -149,7 +149,7 @@ SER_SHORT_LABEL_BY_KEY: Dict[str, str] = {
     "ser_dth_reg_resps": "SerDthRegResps",
     "ser_dth_reqs_meta": "SerDthReqsMeta",
     "ser_dth_fh_outputs": "SerDthFhOutputs",
-    "ser_mw_write_input": "SerMwWriteIn",
+    "ser_mw_write_input": "SerMwWriteInput",
     "ser_mw_write_inject": "SerMwWriteInject",
     "ser_mw_write_ptrs": "SerMwWritePtrs",
 }
@@ -461,7 +461,7 @@ def render_file_joint(
     lines: List[str] = [
         "// GENERATED FILE — do not edit by hand.",
         "// Regenerate:",
-        "//   python3 generators/protoacc/software/gen_protoacc_sweep_configs.py \\",
+        "//   python3 generators/protoacc/software/verilator-bench/gen_protoacc_sweep_configs.py \\",
         "//       --emit joint -t random -n <N> -s <seed> [--debug]",
         "//",
         f"// emit=joint sweep-type={sweep_type} requested_n={num_configs_requested} seed={seed}",
@@ -512,7 +512,7 @@ def render_file_split(
     lines: List[str] = [
         "// GENERATED FILE — do not edit by hand.",
         "// Regenerate (deserializer and serializer sweeps are independent):",
-        "//   python3 generators/protoacc/software/gen_protoacc_sweep_configs.py \\",
+        "//   python3 generators/protoacc/software/verilator-bench/gen_protoacc_sweep_configs.py \\",
         "//       --emit both -t random -n <N> -s <seed> [--debug]",
         "//",
         f"// sweep-type={sweep_type} requested_n_per_side={num_configs_requested} "

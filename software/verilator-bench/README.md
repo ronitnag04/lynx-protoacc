@@ -1,78 +1,206 @@
 # ProtoAcc Verilator Benchmarks
 
-Bare-metal RISC-V workloads that exercise the ProtoAcc accelerator under Chipyard's
-Verilator simulator. Each bench emits `ACCEL_ITER`/`ACCEL_SUMMARY` lines with `mcycle`
-deltas so the post-run parser can compute throughput.
+Bare-metal RISC-V workloads + sweep harness that exercise the ProtoAcc
+accelerator under Chipyard's Verilator simulator. Each bench ELF emits
+`ACCEL_ITER` / `ACCEL_SUMMARY` lines carrying `mcycle` deltas, byte counts,
+and iteration counts so throughput can be derived from the bench log.
+
+The per-config sweep driver ([run_sweep.sh](run_sweep.sh)) iterates every
+emitted `ProtoAccelDesSweepSample*Config` / `ProtoAccelSerSweepSample*Config`,
+builds a Verilator simulator for each, runs all six HPB benches against it,
+appends one row per `(config, bench, op)` to a CSV, and reclaims the
+per-config `generated-src` tree + simulator binary between configs.
+
+## Directory layout
+
+```
+Makefile                       # Bare-metal build (riscv64-unknown-elf-gcc + htif_nano.specs)
+proto_to_accel.py              # .proto + .inc → gen/bench<N>_{descriptors.h,data.c}
+gen_protoacc_sweep_configs.py  # Emits ProtoAccelSweepConfigs.scala (des/ser/joint)
+run_sweep.sh                   # Parallel sweep driver (one worker per config)
+parse_results.py               # Aggregate bench logs → benchmark_results.json
+rocc.h                         # RoCC custom-2/custom-3 inline-asm macros
+accel_rocc.{h,c}               # AccelSetup + static serializer/deserializer regions
+bench_common.h                 # read_mcycle, print_iter/summary
+bench_hpb_{ser,des}.c          # HPB ser/des bench drivers (one ELF per bench via -D)
+bench_tiny_{ser,des}.c         # Minimal hand-crafted validation benches
+bench_repro.c                  # 14 minimal reproducers for state-machine bugs
+bench_isolate.c                # Per-message isolator (debug tool)
+gen/                           # Generated descriptors + data (.gitignored)
+  bench[0-5]_descriptors.h     #   emitted by `make gen`
+  bench[0-5]_data.c            #
+build/                         # Build artifacts (.gitignored)
+  bench[0-5]_{ser,des}.riscv   #   emitted by `make bench`
+```
 
 ## Prerequisites
+
+Source the Chipyard env (puts `riscv64-unknown-elf-gcc`, Verilator, and the
+sbt/firtool toolchain on PATH):
 
 ```bash
 source /home/ec2-user/hyperscale-grpc-chipyard/env.sh
 ```
 
-A Verilator simulator for `ProtoAccelRocketBaseConfig` must already exist at
-`sims/verilator/simulator-chipyard.harness-ProtoAccelRocketBaseConfig`. Build it with:
+For the sweep, `run_sweep.sh` also needs GNU parallel — install via
+`conda install -p $CONDA_PREFIX -c conda-forge parallel` if missing.
+
+## From-scratch workflow
+
+### 1. Generate bench descriptors + data
+
+Reads each HPB `.proto` + `.inc`, samples per-field string/bytes lengths from
+the `.inc` runtime data, and emits `gen/bench<N>_{descriptors.h,data.c}`.
 
 ```bash
+cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
+make gen
+```
+
+Re-run only when a `.proto` schema changes, the generator changes, or you
+want a different RNG seed / cap (see
+`proto_to_accel.py --help` for `--max-nested-depth`, `--max-string-len`,
+`--seed`).
+
+### 2. Build the bench ELFs
+
+```bash
+make bench       # just the 12 HPB ELFs (build/bench[0-5]_{ser,des}.riscv) ← what run_sweep.sh needs
+make             # everything: HPB + tiny validation + 14 repro debug cases
+make clean       # wipe build/ and gen/
+```
+
+### 3. Emit sweep configs
+
+`gen_protoacc_sweep_configs.py` writes `ProtoAccelSweepConfigs.scala` into
+`generators/chipyard/src/main/scala/config/`, containing one
+`ProtoAccelDesSweepSampleNNNConfig` per deserializer-side sample and one
+`ProtoAccelSerSweepSampleNNNConfig` per serializer-side sample.
+
+```bash
+# 32 random samples per side (64 total configs), seed 42:
+python3 gen_protoacc_sweep_configs.py --emit both -t random -n 32 -s 42
+
+# Or a one-factor-at-a-time sweep over active axes only:
+python3 gen_protoacc_sweep_configs.py --emit both -t ofat
+
+# See --help for tweak / joint / default / ser-only / des-only emit modes.
+```
+
+Each emitted class is preceded by a `/** Sweep row N/M (random): Key=val, … */`
+comment, which `run_sweep.sh` parses to recover the parameter vector for
+each CSV row.
+
+### 4. Run the sweep
+
+Defaults match a many-core machine: one worker per CPU, single-threaded
+Verilator builds inside each worker (`make -j1`), and per-config cleanup of
+`sims/verilator/generated-src/chipyard.harness.TestHarness.<cls>` +
+`sims/verilator/simulator-chipyard.harness-<cls>` after the config's benches
+finish. Cleanup keeps disk usage bounded across hundreds of configs.
+
+```bash
+bash run_sweep.sh --output sweep.csv
+```
+
+What this does per config, in parallel:
+1. Build the Verilator simulator (`make CONFIG=<cls>`, cached between runs
+   only if `--keep-artifacts`).
+2. Run every `bench[0-5]_{op}.riscv` where `op` matches the config's side
+   (des-side configs → des benches, ser-side → ser) via
+   `make run-binary-fast BREAK_SIM_PREREQ=1 LOADMEM=1`.
+3. Parse the last `ACCEL_SUMMARY:` line from
+   `sims/verilator/output/chipyard.harness.TestHarness.<cls>/bench<N>_{op}.log`.
+4. Append one CSV row per bench under a file lock.
+5. Delete the per-config `generated-src` tree and simulator binary.
+
+Selected useful flags (see `bash run_sweep.sh --help`):
+
+| Flag                 | Purpose                                                      |
+|----------------------|--------------------------------------------------------------|
+| `--benches b0 b1 …`  | Restrict to a subset of HPB benches (default: all six).      |
+| `--op {ser,des,both}`| Override per-config op selection.                            |
+| `--side {des,ser,both}` | Filter which sample classes run.                          |
+| `--limit N`          | Only the first N matching configs (smoke test).              |
+| `--workers N`        | Parallel configs (default: `nproc`).                         |
+| `--jobs N`           | `make -j` per Verilator build (default: 1).                  |
+| `--keep-artifacts`   | Skip cleanup, useful when debugging a single config.         |
+| `--dry-run`          | Print the plan without building.                             |
+
+**Resume**: re-running with the same `--output` skips any
+`(config_name, bench, op)` already present in the CSV. An interrupted sweep
+picks up where it left off with no wasted Verilator build cost.
+
+### 5. Join with analytical features → training dataset
+
+This lives in the Lynx repo, not here:
+
+```bash
+python3 /home/ec2-user/lynx/build_training_dataset.py \
+    --sweep-csv /tmp/sweep.csv \
+    --output    /tmp/training.csv \
+    --npy-dir   /tmp/training_npy
+```
+
+See [/home/ec2-user/lynx/README.md](/home/ec2-user/lynx/README.md) for the
+downstream training pipeline.
+
+## CSV schema (sweep output)
+
+```
+config_name, side, bench, op, iters, cycles, bytes, throughput_bytes_per_sec,
+wall_s, build_wall_s, build_was_cached,
+des_top_descriptor_reqs, des_top_memloader_reqs, … (9 des_* knobs),
+ser_field_handlers, ser_cr_rocc_commands, … (10 ser_* knobs)
+```
+
+`throughput_bytes_per_sec` assumes the Verilator config's nominal 1 GHz
+clock; rescale if your config targets a different rate.
+
+Inactive-side knobs are recorded at their generator defaults (see
+`DES_DEFAULTS` / `SER_DEFAULTS` in
+[gen_protoacc_sweep_configs.py](gen_protoacc_sweep_configs.py)), so every
+row has a complete 19-column parameter vector.
+
+## Single-bench smoke test (no sweep)
+
+For debugging a single bench on the baseline config without going through
+`run_sweep.sh`:
+
+```bash
+# Build the baseline sim (cached after first time):
 cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
 make CONFIG=ProtoAccelRocketBaseConfig -j$(nproc)
-```
 
-## Build
-
-```bash
-make                  # Build all ELFs → build/*.riscv
-make gen              # Regenerate gen/bench[0-5]_*.{h,c} from lynx/HyperProtoBench .proto files
-make clean            # Remove build/
-```
-
-## Run
-
-```bash
-cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
-
-# Fast path: LOADMEM=1 bypasses the TSI loader (saves ~2min/run on big ELFs)
+# Run bench1 serialize on it:
 BREAK_SIM_PREREQ=1 LOADMEM=1 make CONFIG=ProtoAccelRocketBaseConfig run-binary-fast \
-    BINARY=/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/build/bench_tiny_ser.riscv
-```
+    BINARY=/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/build/bench1_ser.riscv
 
-Output logs land under `sims/verilator/output/chipyard.harness.TestHarness.ProtoAccelRocketBaseConfig/`.
-
-## Aggregate results
-
-After all the bench ELFs have run:
-
-```bash
+# Aggregate bench logs in the baseline output dir → JSON:
+cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
 python3 parse_results.py --output benchmark_results.json
 ```
 
-The output matches the shape `sample_protoacc_model/protobuf_model.py` expects
-in its `default_benchmark_results` dict:
+`parse_results.py` is the quick way to produce the `benchmark_results.json`
+shape `sample_protoacc_model/protobuf_model.py` expects — use the sweep for
+ML training data, this for a single-config sanity check.
 
-```json
-{
-  "serializer":   { "bench0": {"throughput": <bytes/sec>, "cycles": ..., "bytes": ..., "iters": ...}, ... },
-  "deserializer": { ... }
-}
-```
+## Status + known caveats
 
-Default clock is 1 GHz; override with `--clock-hz` if the Chipyard config
-targets a different rate.
+| Bench                      | Status  | Notes |
+|----------------------------|---------|-------|
+| `bench[0-5]_{ser,des}.riscv` | WORKS  | Full HPB multi-field workloads; primitives + strings/bytes (1024 B cap) + nested submessages (depth ≤ 5). |
+| `bench_tiny_{ser,des}.riscv` | WORKS  | Hand-crafted `{int32, string}` — validation baseline. |
+| `bench_repro_c*.riscv`       | Debug  | Minimal reproducers; cases 11/13/14 deliberately fail (packed-buffer string bug). |
+| `bench_isolate_bN_mI.riscv`  | Debug  | Per-message isolator. `make isolate ISOLATE_BENCH=<N>`. |
 
-## Status
+See [STATUS.md](STATUS.md) for measured throughput, paper-target comparison,
+ABI details, and the roadmap.
 
-| Bench                 | Status | Notes |
-|-----------------------|--------|-------|
-| `bench_tiny_ser.riscv`| WORKS  | Hand-crafted `{int32, string}`, produces correct 9-byte wire output |
-| `bench_tiny_des.riscv`| WORKS  | Hand-crafted deser, reconstructs `f1=42 f2="hello"` |
-| `bench[0-5]_ser.riscv`| WORKS  | Full multi-field with primitives, strings/bytes, and nested submessages (up to 3 levels deep). All 6 HyperProtoBench schemas exercised end-to-end. At 1 GHz: bench0=454, bench1=319, bench2=278, bench3=308, bench4=323, bench5=268 MB/s. |
-| `bench_repro_c*.riscv` | Debug | Minimal reproducers used during bug bisection. Cases 11/13/14 still deliberately fail (they demonstrate the packed-buffer string bug). |
-| `bench_isolate_bN_mI.riscv` | Debug | Per-message isolator that compiles ONE top-level message from generated bench data. Useful for bisecting which specific message breaks when regressions appear. |
+## Generator notes (`proto_to_accel.py`)
 
-### Design notes
-
-Per top-level message M the generator emits four separate static arrays, plus
-small spec tables the runtime walks to stitch them together:
+Parses `.proto` + `.inc` via [lynx/analytical_model/protobuf_analyzer.py](/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py).
+Emits per top-level message M:
 
 ```
 M_INSTANCE[obj_size]             # top cpp_obj (primitives + zero slots)
@@ -83,61 +211,12 @@ M_NESTED_SPECS[N*3]              # {parent_instance, parent_slot_offset, nested_
 M_STRING_SPECS[K*5]              # {owner_instance, slot_offset, hdr_idx, payload_offset, length}
 ```
 
-At runtime, `fixup_nested()` + `fixup_strings()` walk the spec tables and patch:
-- parent cpp_obj slot for each nested submessage → absolute address of the nested
-  instance in `NESTED_POOL`
-- parent cpp_obj slot for each string → `((uint64_t)&STRING_HEADERS[i]) | 0x3`
-- `STRING_HEADERS[i].data = &STRING_PAYLOADS[p]; .length = L`
+At runtime, `fixup_nested()` + `fixup_strings()` walk the spec tables and
+patch parent cpp_obj slots with absolute addresses of the nested/string
+records. Why three pools (not one): packing strings or nested instances
+inside the top cpp_obj buffer triggers a hardware fault in the ProtoAcc
+serializer — see the `project_hpb_ser_multifield_bug.md` memory note.
 
-Why three pools (not one): packing strings or nested instances inside the top
-cpp_obj buffer triggers a hardware fault in the ProtoAcc serializer (see
-`project_hpb_ser_multifield_bug.md` memory note for the reproducers). Keeping
-them in distinct static arrays at distinct `.data` addresses avoids the bug.
-
-- **Submessages**: supported. Nested cpp_objs are pre-allocated recursively up
-  to `MAX_NESTED_DEPTH=3`. Each nested instance gets its own primitives and
-  possibly further nested children.
-- **Repeated / map / oneof / groups**: skipped; the generator emits a zero
-  placeholder entry and doesn't set the presence bit.
-
-## Layout
-
-```
-Makefile              # Bare-metal build (riscv64-unknown-elf-gcc + htif_nano.specs)
-rocc.h                # RoCC inline-asm macros
-accel_rocc.{h,c}      # AccelSetup / AccelSetupAllocRegionSerializer / helpers
-bench_common.h        # read_mcycle(), print_iter/summary
-bench_tiny_ser.c      # Minimal working serialize bench
-bench_tiny_des.c      # Minimal working deserialize bench
-bench_hpb_ser.c       # Generic HPB-style serialize bench (wires in gen/benchN_*.h)
-gen/
-  proto_to_accel.py   # Generator: .proto → {benchN_descriptors.h, benchN_data.c}
-  bench[0-5]_*.{h,c}  # Generated descriptors + pre-initialized cpp_obj instances
-build/                # Build artifacts (.gitignored)
-```
-
-## Generator caveats
-
-`gen/proto_to_accel.py` parses schemas via [lynx/analytical_model/protobuf_analyzer.py](/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py)
-and emits per-message descriptors + pre-initialized top-level instances. Current
-scope for MVP:
-
-- Primitive scalars (int32/64, uint32/64, float, double, bool, fixed*, sfixed*, sint*) + string/bytes
-- Enums are emitted as int32
-- **Submessages are disabled** (set `DISABLE_SUBMESSAGES = False` in the generator to re-enable
-  once the runtime issues are resolved)
-- Repeated fields: skipped (emitted as zero placeholder + not-present hasbits)
-- `oneof`, `map`, groups: not supported
-
-cpp_obj layout is forced to match the hardware-assumed shape `des/fieldhandler.scala:66`:
-```
-[ 0..16]   vptr/cached_size placeholder (zero)
-[16..]     hasbits chunks (one 4B chunk per 32 relative_fieldnos)
-[24+]      fields, packed 8-byte aligned, offsets encoded in descriptor entries
-```
-
-String/bytes fields use a tagged-ArenaStringPtr convention: the 8B slot in cpp_obj
-holds `(hdr_addr | 0x3)`, where the header is `{char* data_ptr; size_t length; payload...}`
-appended to the instance buffer tail. The bench's `fixup_instance()` patches the
-relocatable byte-offset markers emitted by the generator into absolute addresses
-at startup.
+Coverage: primitive scalars (int32/64, uint, sint, sfixed, fixed, float,
+double, bool), enums (as int32), string/bytes, nested messages up to depth
+5. **Skipped**: `repeated` (3% of HPB fields), `oneof`, `map`, groups.

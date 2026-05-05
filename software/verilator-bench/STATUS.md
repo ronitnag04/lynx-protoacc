@@ -2,10 +2,16 @@
 
 _Last updated: 2026-05-04_
 
-A bare-metal RISC-V workload suite that runs HyperProtoBench serialization +
-deserialization schemas on the ProtoAcc RoCC accelerator under Chipyard's
-Verilator simulator, producing cycle-count / throughput data for the Lynx ML
-throughput model.
+A bare-metal RISC-V workload suite plus a parameter-sweep harness that runs
+HyperProtoBench serialization + deserialization schemas on the ProtoAcc
+RoCC accelerator under Chipyard's Verilator simulator. Outputs:
+
+- Per-bench cycle/byte/throughput (`benchmark_results.json` for a single
+  Verilator config, via [parse_results.py](parse_results.py)).
+- Per-`(config, bench, op)` training rows for the Lynx ML throughput model,
+  via [run_sweep.sh](run_sweep.sh) iterating the
+  `ProtoAccelDesSweepSample*` / `ProtoAccelSerSweepSample*` configs emitted
+  by [gen_protoacc_sweep_configs.py](gen_protoacc_sweep_configs.py).
 
 ## Goal
 
@@ -76,7 +82,7 @@ profile applied; a full-HPB-scoped sibling is saved as
   wired for FireSim).
 
 ### 2. Generator: `.proto` + `.inc` → C benchmark data
-[gen/proto_to_accel.py](gen/proto_to_accel.py)
+[proto_to_accel.py](proto_to_accel.py)
 
 - Reuses the Lynx `ProtobufAnalyzer` directly (imports from
   `/home/ec2-user/lynx/analytical_model/protobuf_analyzer.py`) so we get the
@@ -134,36 +140,61 @@ for the full ABI cheat-sheet.
 | [bench_hpb_des.c](bench_hpb_des.c)        | Matching HPB deserializer bench driver. Feeds `TOP_MESSAGE_WIRE[m]` (generator-emitted wire bytes for each top-level message) through `AccelParseFromString_Helper`; reissues `AccelSetup()` between iters so the accelerator's array-alloc region doesn't overflow on long runs. |
 | [bench_isolate.c](bench_isolate.c)        | Per-message isolator — serialize ONE top-level message from a bench. Debug tool. |
 | [bench_repro.c](bench_repro.c)            | 14 hand-crafted reproducer cases covering every hardware state-machine combination we've tested. Cases 11/13/14 deliberately fail (documented bugs). |
-| [gen/proto_to_accel.py](gen/proto_to_accel.py) | The generator. ~750 LOC. |
-| [gen/bench<N>_{data.c,descriptors.h}](gen/) | Auto-generated per-bench. Ignored by git; regen via `make gen`. |
+| [proto_to_accel.py](proto_to_accel.py)    | The generator: `.proto` + `.inc` → `gen/bench<N>_{descriptors.h,data.c}`. |
+| [gen_protoacc_sweep_configs.py](gen_protoacc_sweep_configs.py) | Emit `ProtoAccelSweepConfigs.scala` (random / ofat / tweak / default; des / ser / both / joint). |
+| [run_sweep.sh](run_sweep.sh)              | Parallel sweep driver: one worker per config, `make CONFIG=<cls>` + run all six HPB benches, append CSV row per `(config, bench, op)`, cleanup generated-src + simulator after each config. |
 | [parse_results.py](parse_results.py)      | Scans `output/*.log` → `benchmark_results.json`. |
-| [Makefile](Makefile)                      | Build targets: `all`, `gen`, `clean`. |
+| [gen/bench<N>_{data.c,descriptors.h}](gen/) | Auto-generated per-bench. Ignored by git; regen via `make gen`. |
+| [Makefile](Makefile)                      | Build targets: `all` (every ELF), `bench` (just HPB ELFs — what `run_sweep.sh` needs), `gen` (regen descriptors + data), `clean` (wipe `build/` and `gen/`), `isolate`. |
 
-### 6. Build + run recipe
+### 6. Build + run recipes
+
+[README.md](README.md) has the full step-by-step; the condensed versions:
+
+**Single-config smoke test** (one bench on the baseline sim):
 
 ```bash
 source /home/ec2-user/hyperscale-grpc-chipyard/env.sh
 
-# One-time: build the Verilator sim (~15 min on first build, cached after).
-cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
-make CONFIG=ProtoAccelRocketBaseConfig -j$(nproc)
+# One-time: Verilator baseline sim (~15 min on first build, cached after).
+make -C /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator \
+    CONFIG=ProtoAccelRocketBaseConfig -j$(nproc)
 
-# Generate bench data + build ELFs.
+# Bench descriptors + ELFs (build/bench[0-5]_{ser,des}.riscv):
 cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
-make gen   # .proto + .inc → gen/bench<N>_*.{c,h}
-make       # → build/bench<N>_ser.riscv
+make gen       # .proto + .inc → gen/bench<N>_{descriptors.h,data.c}
+make bench     # just the 12 HPB ELFs (make alone → also tiny + repro)
 
 # Run one bench (LOADMEM=1 bypasses TSI loader, saves ~2 min/run).
 cd /home/ec2-user/hyperscale-grpc-chipyard/sims/verilator
 BREAK_SIM_PREREQ=1 LOADMEM=1 make CONFIG=ProtoAccelRocketBaseConfig run-binary-fast \
     BINARY=/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench/build/bench1_ser.riscv
 
-# Aggregate all bench logs → JSON matching Lynx's consumer schema.
+# Aggregate logs in the baseline output dir → benchmark_results.json.
 cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
 python3 parse_results.py --output benchmark_results.json
 ```
 
-Output logs land in `sims/verilator/output/chipyard.harness.TestHarness.ProtoAccelRocketBaseConfig/bench<N>_ser.log`.
+Output logs land in `sims/verilator/output/chipyard.harness.TestHarness.ProtoAccelRocketBaseConfig/bench<N>_{ser,des}.log`.
+
+**Full HW-parameter sweep** (produces the ML training CSV):
+
+```bash
+source /home/ec2-user/hyperscale-grpc-chipyard/env.sh
+cd /home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/verilator-bench
+make gen && make bench
+
+# Emit N random samples per side into ProtoAccelSweepConfigs.scala.
+python3 gen_protoacc_sweep_configs.py --emit both -t random -n 32 -s 42
+
+# Run every emitted sample config × all six HPB benches in parallel.
+# Defaults: --workers=nproc, --jobs=1, auto-clean per-config artifacts.
+bash run_sweep.sh --output sweep.csv
+```
+
+The sweep driver skips `(config, bench, op)` tuples already present in
+`--output`, so an interrupted run resumes cleanly. See
+[run_sweep.sh](run_sweep.sh) header + `--help` for flag reference.
 
 ## Known bugs and gotchas
 
@@ -239,14 +270,14 @@ scoped one; `extracted_features_full.json` is the unconstrained reference.
 
 ## Next steps (prioritized)
 
-### 1. Kick off the parameter sweep to generate ML training data
-The bench pipeline is now complete enough to drive the config sweep. Use
-[/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/gen_protoacc_sweep_configs.py](/home/ec2-user/hyperscale-grpc-chipyard/generators/protoacc/software/gen_protoacc_sweep_configs.py)
-to generate `ProtoAccelDesSweepSample*` / `ProtoAccelSerSweepSample*` configs
-(already supports random, ofat, tweak, joint). Run each sample config through
-the same `bench[0-5]_{ser,des}.riscv` binaries, parse, and pair cycle counts
-with the workload feature vectors in `extracted_features.json` for ML
-training.
+### 1. ~~Kick off the parameter sweep to generate ML training data~~ — DONE
+
+The sweep harness is now in-tree:
+[gen_protoacc_sweep_configs.py](gen_protoacc_sweep_configs.py) emits the
+sample configs and [run_sweep.sh](run_sweep.sh) drives Verilator builds +
+bench runs in parallel, one row per `(config, bench, op)` in the output
+CSV. Downstream joining with analytical features happens in
+[/home/ec2-user/lynx/build_training_dataset.py](/home/ec2-user/lynx/build_training_dataset.py).
 
 ### 2. Raise per-bench iteration count (easy lever)
 `ITERS=4` undercounts steady-state behavior because each bench includes a
@@ -308,9 +339,10 @@ Probably needs iteration.
 
 ## Files to read first (for a new collaborator)
 
-1. [README.md](README.md) — basic usage
-2. This file — project state and roadmap
-3. [gen/proto_to_accel.py](gen/proto_to_accel.py) — the data model
+1. [README.md](README.md) — from-scratch workflow (generate → build → sweep → training CSV)
+2. This file — project state, measured vs paper throughput, and roadmap
+3. [proto_to_accel.py](proto_to_accel.py) — the data model
 4. [bench_hpb_ser.c](bench_hpb_ser.c) — the runtime driver
-5. `~/.claude/projects/-home-ec2-user/memory/reference_protoacc_abi.md` — hardware ABI
-6. `~/.claude/projects/-home-ec2-user/memory/project_hpb_*.md` — the three bug/feature memory notes
+5. [run_sweep.sh](run_sweep.sh) + [gen_protoacc_sweep_configs.py](gen_protoacc_sweep_configs.py) — the sweep harness
+6. `~/.claude/projects/-home-ec2-user/memory/reference_protoacc_abi.md` — hardware ABI
+7. `~/.claude/projects/-home-ec2-user/memory/project_hpb_*.md` — the bug/feature memory notes

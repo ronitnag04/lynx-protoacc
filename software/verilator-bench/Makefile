@@ -39,10 +39,17 @@ ISOLATE_ELFS  := $(addprefix $(BUILD)/,$(addprefix isolate_bench$(ISOLATE_BENCH)
 BENCHES      := $(TINY_BENCHES) $(HPB_BENCHES)
 ELFS         := $(addprefix $(BUILD)/,$(addsuffix .riscv,$(BENCHES))) $(REPRO_ELFS)
 
-.PHONY: all clean gen
-all: $(ELFS)
+# Target sets:
+#   all   — every ELF (tiny, HPB ser/des, repro debug cases). Default.
+#   bench — just the HPB bench[0-5]_{ser,des}.riscv ELFs that run_sweep.sh
+#           consumes; skips tiny validation + repro debug workloads.
+HPB_ELFS := $(addprefix $(BUILD)/,$(addsuffix .riscv,$(HPB_BENCHES)))
 
-$(BUILD) $(BUILD)/gen:
+.PHONY: all bench clean gen
+all: $(ELFS)
+bench: $(HPB_ELFS)
+
+$(BUILD):
 	mkdir -p $@
 
 # Tiny benches
@@ -58,7 +65,8 @@ $(BUILD)/bench_tiny_des.riscv: $(BUILD)/bench_tiny_des.o $(COMMON_OBJS) | $(BUIL
 # HyperProtoBench serializer benches. For each bench<N>_ser we compile
 # bench_hpb_ser.c with -DBENCH_NAME / -DBENCH_DESCRIPTORS_H selecting the
 # generated header, plus the generated data.c providing the instance bytes.
-$(BUILD)/gen/bench%_data.o: gen/bench%_data.c gen/bench%_descriptors.h | $(BUILD)/gen
+# Data objects live directly under $(BUILD) (no $(BUILD)/gen subdir).
+$(BUILD)/bench%_data.o: gen/bench%_data.c gen/bench%_descriptors.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/bench%_ser.o: bench_hpb_ser.c gen/bench%_descriptors.h $(HEADERS) | $(BUILD)
@@ -66,7 +74,7 @@ $(BUILD)/bench%_ser.o: bench_hpb_ser.c gen/bench%_descriptors.h $(HEADERS) | $(B
 	      -DBENCH_DESCRIPTORS_H=\"bench$*_descriptors.h\" \
 	      -c $< -o $@
 
-$(BUILD)/bench%_ser.riscv: $(BUILD)/bench%_ser.o $(BUILD)/gen/bench%_data.o $(COMMON_OBJS) | $(BUILD)
+$(BUILD)/bench%_ser.riscv: $(BUILD)/bench%_ser.o $(BUILD)/bench%_data.o $(COMMON_OBJS) | $(BUILD)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 # HyperProtoBench deserializer benches. Same pattern as ser but wires in
@@ -76,7 +84,7 @@ $(BUILD)/bench%_des.o: bench_hpb_des.c gen/bench%_descriptors.h $(HEADERS) | $(B
 	      -DBENCH_DESCRIPTORS_H=\"bench$*_descriptors.h\" \
 	      -c $< -o $@
 
-$(BUILD)/bench%_des.riscv: $(BUILD)/bench%_des.o $(BUILD)/gen/bench%_data.o $(COMMON_OBJS) | $(BUILD)
+$(BUILD)/bench%_des.riscv: $(BUILD)/bench%_des.o $(BUILD)/bench%_data.o $(COMMON_OBJS) | $(BUILD)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 # Minimal reproducers for the multi-field dispatch bug.
@@ -95,7 +103,7 @@ $(BUILD)/isolate_bench$(ISOLATE_BENCH)_m%.o: bench_isolate.c $(HEADERS) gen/benc
 	      -DISOLATE_MSG_IDX=$* \
 	      -c $< -o $@
 
-$(BUILD)/isolate_bench$(ISOLATE_BENCH)_m%.riscv: $(BUILD)/isolate_bench$(ISOLATE_BENCH)_m%.o $(BUILD)/gen/bench$(ISOLATE_BENCH)_data.o $(COMMON_OBJS) | $(BUILD)
+$(BUILD)/isolate_bench$(ISOLATE_BENCH)_m%.riscv: $(BUILD)/isolate_bench$(ISOLATE_BENCH)_m%.o $(BUILD)/bench$(ISOLATE_BENCH)_data.o $(COMMON_OBJS) | $(BUILD)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 .PHONY: isolate
@@ -105,10 +113,11 @@ isolate: $(ISOLATE_ELFS)
 HPB_DIR ?= /home/ec2-user/lynx/HyperProtoBench
 gen: $(foreach b,0 1 2 3 4 5,gen/bench$(b)_descriptors.h gen/bench$(b)_data.c)
 
-gen/bench%_descriptors.h gen/bench%_data.c: $(HPB_DIR)/bench%/benchmark.proto gen/proto_to_accel.py
-	python3 gen/proto_to_accel.py --proto $< \
+gen/bench%_descriptors.h gen/bench%_data.c: $(HPB_DIR)/bench%/benchmark.proto proto_to_accel.py
+	mkdir -p gen
+	python3 proto_to_accel.py --proto $< \
 	  --out-header gen/bench$*_descriptors.h \
 	  --out-source gen/bench$*_data.c
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) gen
