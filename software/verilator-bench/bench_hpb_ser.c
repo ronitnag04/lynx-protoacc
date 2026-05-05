@@ -19,7 +19,7 @@
 #endif
 
 #ifndef ITERS
-#define ITERS 4
+#define ITERS 1
 #endif
 
 #include BENCH_DESCRIPTORS_H
@@ -87,9 +87,9 @@ static void fixup_strings(int m) {
 
 int main(void) {
     printf("%s: start, n_top=%d\n", BENCH_NAME, TOP_MESSAGE_COUNT);
-    // Serializer output region: one ptr per (message × iter × warmup).
+    // Serializer output region: one ptr per (message × iter).
     const int n_top = TOP_MESSAGE_COUNT;
-    const int total_ptrs = n_top * (ITERS + 1) + 1;  // +1 warmup ptr headroom
+    const int total_ptrs = n_top * ITERS + 1;
     // Data region sized to absorb 40 iters × up to ~2 KB per message. Matches
     // the static ACCEL_SER_DATA_BYTES region in accel_rocc.c (128 KB).
     volatile char **ptrs = AccelSetupAllocRegionSerializer(total_ptrs + 4, 128 * 1024);
@@ -112,16 +112,13 @@ int main(void) {
         printf("  [%02x] 0x%016lx\n", i, v);
     }
 
-    // Warm-up (not measured).
-    printf("%s: dispatching warmup for %s\n", BENCH_NAME, TOP_MESSAGE_NAMES[0]);
-    AccelSerializeToString_Helper(TOP_MESSAGE_DESCRIPTORS[0],
-                                  TOP_MESSAGE_INSTANCE_PTRS[0]);
-    (void)BlockOnSerializedValue(ptrs, 0);
-    printf("%s: warmup done\n", BENCH_NAME);
+    // No warmup: each message is measured cold on its first (and only)
+    // iteration. The cache-miss premium is intentionally baked in so the
+    // downstream ML model can regress it against schema features.
 
     uint64_t total_cycles = 0;
     uint64_t total_bytes = 0;
-    int idx = 1;
+    int idx = 0;
 
     for (int m = 0; m < n_top; m++) {
         const uint64_t *descr = TOP_MESSAGE_DESCRIPTORS[m];
@@ -133,13 +130,13 @@ int main(void) {
             uint64_t t1 = read_mcycle();
             size_t len = GetSerializedLength(ptrs, idx);
             uint64_t cyc = t1 - t0;
-            printf("ACCEL_ITER: bench=%s msg=%s i=%d cycles=%lu bytes=%lu\n",
+            printf("ACCEL_MESSAGE: bench=%s msg=%s i=%d cycles=%lu bytes=%lu\n",
                    BENCH_NAME, TOP_MESSAGE_NAMES[m], i, cyc, (uint64_t)len);
             total_cycles += cyc;
             total_bytes += len;
         }
     }
 
-    print_summary(BENCH_NAME, "ser", n_top * ITERS, total_cycles, total_bytes);
+    print_summary(BENCH_NAME, "ser", ITERS, total_cycles, total_bytes);
     return 0;
 }

@@ -25,7 +25,7 @@
 #endif
 
 #ifndef ITERS
-#define ITERS 4
+#define ITERS 1
 #endif
 
 #include BENCH_DESCRIPTORS_H
@@ -50,16 +50,9 @@ int main(void) {
         printf("\n");
     }
 
-    // Warm-up (not measured): one PROTO_PARSE on the first message.
-    memset(TOP_MESSAGE_DES_DEST[0], 0, TOP_MESSAGE_SIZES[0]);
-    printf("%s: dispatching warmup for %s\n", BENCH_NAME, TOP_MESSAGE_NAMES[0]);
-    AccelParseFromString_Helper(TOP_MESSAGE_DESCRIPTORS[0],
-                                 TOP_MESSAGE_DES_DEST[0],
-                                 TOP_MESSAGE_WIRE[0],
-                                 TOP_MESSAGE_WIRE_LEN[0]);
-    (void)block_on_completion();
-    asm volatile("fence");
-    printf("%s: warmup done\n", BENCH_NAME);
+    // No warmup: each message is measured cold on its first (and only)
+    // iteration. The cache-miss premium is intentionally baked in so the
+    // downstream ML model can regress it against schema features.
 
     uint64_t total_cycles = 0;
     uint64_t total_bytes = 0;
@@ -86,13 +79,13 @@ int main(void) {
             uint64_t t1 = read_mcycle();
             asm volatile("fence");
             uint64_t cyc = t1 - t0;
-            printf("ACCEL_ITER: bench=%s msg=%s i=%d cycles=%lu bytes=%lu\n",
+            printf("ACCEL_MESSAGE: bench=%s msg=%s i=%d cycles=%lu bytes=%lu\n",
                    BENCH_NAME, TOP_MESSAGE_NAMES[m], i, cyc, (uint64_t)wire_len);
             total_cycles += cyc;
             total_bytes += wire_len;
         }
     }
 
-    print_summary(BENCH_NAME, "des", n_top * ITERS, total_cycles, total_bytes);
+    print_summary(BENCH_NAME, "des", ITERS, total_cycles, total_bytes);
     return 0;
 }

@@ -10,6 +10,7 @@ gen/bench*_descriptors.h
 
 # Benchmark results (regenerate with `parse_results.py`)
 benchmark_results.json
+*.csv
 
 # Runtime / debug
 *.log
@@ -22,3 +23,4 @@ benchmark_results.json
 *~
 .DS_Store
 __pycache__/
+*.lock

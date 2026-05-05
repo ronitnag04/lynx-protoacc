@@ -278,14 +278,15 @@ bench runs in parallel, one row per `(config, bench, op)` in the output
 CSV. Downstream joining with analytical features happens in
 [../lynx/build_training_dataset.py](../lynx/build_training_dataset.py).
 
-### 2. Raise per-bench iteration count (easy lever)
-`ITERS=4` undercounts steady-state behavior because each bench includes a
-warmup pass that eats first-iteration cache/TLB fills. Bumping to
-`ITERS=16` or `32` makes the measurement window more stable and shrinks
-relative noise. Memory budget check: each iter burns ~1 message's worth of
-serializer output (~1-2 KB); the 128 KB static region fits ~50 iters × 10
-messages comfortably. Deserializer is unaffected because it resets its
-array region per iter.
+### 2. Cold-cache measurement: one iteration per message
+The HPB benches run `ITERS=1` with no warmup — each message is measured on
+its first (and only) parse/serialize, so cache/TLB fill cost is intentionally
+included in the cycle count. This matches real protobuf workloads (messages
+typically arrive cold) and lets the downstream ML model regress the
+cache-miss premium against schema features rather than needing to predict a
+warm/cold blend. Per-sample variance is higher than with multi-iter
+averaging; the sweep compensates by exercising many distinct messages across
+configs.
 
 ### 3. Close the serializer throughput gap (2-3× below paper)
 Serializer is 23–33 Gb/s at 1.84 GHz on bench0/1/3/4 — paper reports

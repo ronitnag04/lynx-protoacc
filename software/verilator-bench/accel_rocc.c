@@ -46,7 +46,7 @@ void AccelSetup(void) {
 
 // Serializer output regions use static BSS so we don't pound the small
 // htif_nano malloc heap. Sized to absorb HPB-realistic payloads: 10 top-level
-// messages × (ITERS+1) iters × up to ~2 KB each ≈ 80 KB; 128 KB gives headroom
+// messages × ITERS iters × up to ~2 KB each; 128 KB gives headroom
 // without bloating the ELF.
 #ifndef ACCEL_SER_DATA_BYTES
 #define ACCEL_SER_DATA_BYTES  (128 * 1024)
