@@ -20,6 +20,7 @@
 #
 # Usage (see --help):
 #   run_sweep.sh --output out.csv --side des --op des --workers 8
+#   run_sweep.sh --output out.csv --random-bench   # one random DEFAULT_BENCH per config
 
 set -euo pipefail
 
@@ -108,6 +109,8 @@ Usage: $0 [options] --output OUT.csv
   --skip-build                don't build missing sims
   --keep-artifacts            don't delete generated-src/sim binary after use
   --skip-upload               don't zip+upload per-config artifacts to S3
+  --random-bench              per config, run one bench chosen at random from
+                              DEFAULT_BENCHES (ignores --bench / --benches)
   --dry-run                   print plan and exit
 EOF
 }
@@ -124,6 +127,7 @@ SKIP_BUILD=0
 KEEP_ARTIFACTS=0
 SKIP_UPLOAD=0
 DRY_RUN=0
+RANDOM_BENCH=0
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -140,6 +144,7 @@ while [[ $# -gt 0 ]]; do
     --skip-build)     SKIP_BUILD=1; shift ;;
     --keep-artifacts) KEEP_ARTIFACTS=1; shift ;;
     --skip-upload)    SKIP_UPLOAD=1; shift ;;
+    --random-bench)   RANDOM_BENCH=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)                echo "unknown arg: $1" >&2; usage; exit 2 ;;
@@ -147,7 +152,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$OUTPUT" ]] && { echo "--output is required" >&2; exit 2; }
-[[ ${#BENCHES[@]} -eq 0 ]] && BENCHES=("${DEFAULT_BENCHES[@]}")
+if (( RANDOM_BENCH == 0 )); then
+  [[ ${#BENCHES[@]} -eq 0 ]] && BENCHES=("${DEFAULT_BENCHES[@]}")
+fi
 
 # Source the Chipyard env once — every downstream sbt/make/java call inherits.
 # env.sh triggers conda activate hooks that reference unset vars (e.g. $RISCV
@@ -263,13 +270,22 @@ fi
 TOTAL_CONFIGS=$(wc -l < "$PLAN_FILE")
 (( TOTAL_CONFIGS == 0 )) && { echo "No ProtoAccel*Sweep*Config classes found." >&2; exit 1; }
 
-echo "Sweep plan: $TOTAL_CONFIGS configs × ${#BENCHES[@]} bench(es) × op=$OP" >&2
+if (( RANDOM_BENCH == 1 )); then
+  echo "Sweep plan: $TOTAL_CONFIGS configs × 1 random bench (from DEFAULT_BENCHES) × op=$OP" >&2
+else
+  echo "Sweep plan: $TOTAL_CONFIGS configs × ${#BENCHES[@]} bench(es) × op=$OP" >&2
+fi
 
 if (( DRY_RUN == 1 )); then
   while IFS=$'\t' read -r cls side _; do
-    for bench in "${BENCHES[@]}"; do
-      echo "  would run $cls [$side] bench=$bench op=$OP"
-    done
+    if (( RANDOM_BENCH == 1 )); then
+      rb_idx=$((RANDOM % ${#DEFAULT_BENCHES[@]}))
+      echo "  would run $cls [$side] bench=${DEFAULT_BENCHES[$rb_idx]} op=$OP"
+    else
+      for bench in "${BENCHES[@]}"; do
+        echo "  would run $cls [$side] bench=$bench op=$OP"
+      done
+    fi
   done < "$PLAN_FILE"
   exit 0
 fi
@@ -285,6 +301,8 @@ export CHIPYARD_ROOT VERILATOR_DIR VERILATOR_OUTPUT_ROOT VERILATOR_GENERATED_SRC
 export BENCH_BUILD_DIR OUTPUT OP JOBS BENCH_TIMEOUT SKIP_BUILD KEEP_ARTIFACTS
 export SKIP_UPLOAD S3_BUCKET S3_BUILD_KEY_PREFIX S3_SIM_KEY_PREFIX S3_BUILD_PREFIX S3_SIM_PREFIX AWS_PROFILE_NAME
 export BENCHES_STR="${BENCHES[*]}"
+export DEFAULT_BENCHES_STR="${DEFAULT_BENCHES[*]}"
+export RANDOM_BENCH
 export PARAM_KEYS_STR="${PARAM_KEYS[*]}"
 export DEFAULTS_STR
 DEFAULTS_STR=""
@@ -339,13 +357,24 @@ worker() {
   # Figure out which (bench, op) pairs still need a row in the CSV.
   local -a pending=()
   local op bench
-  for op in "${ops[@]}"; do
-    for bench in $BENCHES_STR; do
+  if (( RANDOM_BENCH == 1 )); then
+    local -a rb_benches=()
+    read -ra rb_benches <<< "$DEFAULT_BENCHES_STR"
+    bench=${rb_benches[$((RANDOM % ${#rb_benches[@]}))]}
+    for op in "${ops[@]}"; do
       if ! grep -q "^${cls},${side},${bench},${op}," "$OUTPUT" 2>/dev/null; then
         pending+=("${bench}:${op}")
       fi
     done
-  done
+  else
+    for op in "${ops[@]}"; do
+      for bench in $BENCHES_STR; do
+        if ! grep -q "^${cls},${side},${bench},${op}," "$OUTPUT" 2>/dev/null; then
+          pending+=("${bench}:${op}")
+        fi
+      done
+    done
+  fi
   if (( ${#pending[@]} == 0 )); then
     echo "[skip-done] $cls" >&2
     # Still try to upload: a prior run may have produced CSV rows but
