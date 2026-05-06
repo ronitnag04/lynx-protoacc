@@ -8,19 +8,31 @@
 # parallel. Each worker builds its config's Verilator sim, runs every
 # pending (bench, op) pair against it, appends the results to the CSV under
 # a file lock, and (unless --keep-artifacts) deletes the per-config
-# generated-src tree + simulator binary to bound disk usage.
+# generated-src tree + simulator binary to bound disk usage. After a
+# successful simulation-output upload to S3 (or if that zip already exists
+# remotely), the matching output/ tree is removed too unless --keep-artifacts.
 #
 # By default the worker also zips and uploads the per-config build artifacts
 # and simulation outputs to S3 before local cleanup:
 #   generated-src + simulator   → s3://ronitnag04-lynx/verilator_build_files/<cls>.zip
 #   output/<cls>/                → s3://ronitnag04-lynx/simulation_files/<cls>.zip
 # This step is skipped (with a log line) if aws/zip are missing or if
-# --skip-upload is passed. Upload failures are non-fatal: they log and the
-# sweep continues.
+# --skip-upload is passed (local output/ is kept when upload is skipped).
+# Upload failures are non-fatal: they log and the sweep continues.
+#
+# Side (--side) vs op (--op):
+#   --side filters which Scala config classes enter the sweep (DesSweep / SerSweep /
+#   joint ProtoAccelSweep rows in ProtoAccelSweepConfigs.scala).
+#   --op selects which benchmark ELFs run (*_des.riscv vs *_ser.riscv).
+#   Default --op both: DesSweep configs run only des benches; SerSweep only ser;
+#   joint configs run both. So --side des|ser with default --op is already
+#   side-aligned; --op des|ser matters when --side both includes joint configs,
+#   or to force one ELF flavor on every included row.
 #
 # Usage (see --help):
-#   run_sweep.sh --output out.csv --side des --op des --workers 8
-#   run_sweep.sh --output out.csv --random-bench   # one random DEFAULT_BENCH per config
+#   run_sweep.sh --output out.csv --side des --workers 8   # des configs + des ELFs (default op)
+#   run_sweep.sh --output out.csv --side both --op des     # all configs, only *_des benches
+#   run_sweep.sh --output out.csv --random-bench           # one random DEFAULT_BENCH per config
 
 set -euo pipefail
 
@@ -99,8 +111,16 @@ Usage: $0 [options] --output OUT.csv
 
   --bench NAME                single bench (e.g. bench1)
   --benches NAME1 NAME2 ...   multiple benches (terminates at next --flag)
-  --op {ser,des,both}         default: both
-  --side {des,ser,both}       default: both
+  --side {des,ser,both}       which ProtoAccel*Sweep*Config rows to include (from
+                              ProtoAccelSweepConfigs.scala): DesSweep-only,
+                              SerSweep-only, or all rows including joint configs.
+                              Default: both.
+  --op {ser,des,both}         which benchmark ELFs to run per row (*_des.riscv /
+                              *_ser.riscv). Default both: DesSweep rows run only
+                              des benches, SerSweep rows only ser benches, joint
+                              rows run both. Use --op des or --op ser to force that
+                              ELF on every included row (e.g. with --side both).
+                              Default: both.
   --limit N                   only run first N configs (0 = all)
   --output PATH               CSV output path (required)
   --jobs N                    make -j for each Verilator build (default: 1)
@@ -112,6 +132,10 @@ Usage: $0 [options] --output OUT.csv
   --random-bench              per config, run one bench chosen at random from
                               DEFAULT_BENCHES (ignores --bench / --benches)
   --dry-run                   print plan and exit
+
+  --side selects hardware configs; --op selects workloads. With default --op,
+  --side des or --side ser already restricts runs to matching *_des or *_ser ELFs;
+  --op is redundant there unless you narrow joint runs when using --side both.
 EOF
 }
 
@@ -195,36 +219,53 @@ make -C "$VERILATOR_DIR" CONFIG=ProtoAccelRocketConfig "$CLASSPATH_JAR" >/dev/nu
 # comment and the following `class` declaration into one record.
 PLAN_FILE=$(mktemp -t protoacc_sweep.XXXXXX)
 
-# On Ctrl+C / SIGTERM, tear down every descendant before exiting. Without this
-# the subprocess tree outlives the script: parallel only signals its direct
-# jobs (the worker bash shells); `make` keeps running its recipe until the
-# current cc1plus/verilator/java returns, and sbt-launched JVMs ignore
-# SIGTERM for many seconds. Walk the pid tree with pgrep -P and escalate
-# TERM → KILL so nothing is left orphaned.
-DESCENDANTS=()
-_collect_descendants() {
-  local parent=$1 c
-  for c in $(pgrep -P "$parent" 2>/dev/null); do
-    DESCENDANTS+=("$c")
-    _collect_descendants "$c"
+# On Ctrl+C / SIGTERM, tear down before exiting. Sending one wave of signals to
+# every descendant at once is unsafe: killing a worker bash before cc1plus /
+# verilator / chipyard.Generator exits orphans those processes (they reparent
+# to PID 1 and keep running). Kill deepest descendants first (bottom-up), then
+# TERM → KILL with a short pause. Any orphans still tied to this repo get a
+# final UID-scoped sweep (_pkill_chipyard_stragglers).
+_kill_descendants_bottom_up() {
+  local sig=$1 parent=$2 child
+  for child in $(pgrep -P "$parent" 2>/dev/null || true); do
+    [[ "$child" == "$$" ]] && continue
+    _kill_descendants_bottom_up "$sig" "$child"
+    kill -"$sig" "$child" 2>/dev/null || true
   done
 }
-kill_tree() {
-  local sig=$1
-  DESCENDANTS=()
-  _collect_descendants $$
-  if (( ${#DESCENDANTS[@]} > 0 )); then
-    kill -"$sig" "${DESCENDANTS[@]}" 2>/dev/null || true
-  fi
+
+# Processes no longer under $$ (e.g. orphaned make children). Match only when
+# cmdline suggests this Chipyard checkout or Verilator sim dir; same UID only.
+_pkill_chipyard_stragglers() {
+  local sig=$1 u=${EUID:-$(id -u)} pid rest
+  pkill -"$sig" -u "$u" -f 'chipyard\.Generator' 2>/dev/null || true
+  while read -r pid rest; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    case "$rest" in
+      *"$CHIPYARD_ROOT"*|"*$VERILATOR_DIR"*)
+        case "$rest" in
+          *verilator*|*cc1plus*|*"/cc1 "*|*simulator-chipyard*|*V[A-Za-z0-9_]*__ALL*)
+            kill -"$sig" "$pid" 2>/dev/null || true
+            ;;
+        esac
+        ;;
+    esac
+  done < <(pgrep -u "$u" -af . 2>/dev/null || true)
 }
-cleanup_tmp() { rm -f "$PLAN_FILE" "$PLAN_FILE".tmp 2>/dev/null || true; }
+cleanup_tmp() {
+  rm -f "$PLAN_FILE" "$PLAN_FILE".tmp 2>/dev/null || true
+  [[ -n "${CSV_LOCK:-}" ]] && rm -f "$CSV_LOCK" 2>/dev/null || true
+}
 on_interrupt() {
   trap '' INT TERM  # ignore further signals while we tear down
   echo "" >&2
   echo "[abort] interrupt received — terminating sweep subprocesses..." >&2
-  kill_tree TERM
-  sleep 2
-  kill_tree KILL
+  _kill_descendants_bottom_up TERM $$
+  sleep 3
+  _kill_descendants_bottom_up KILL $$
+  _pkill_chipyard_stragglers TERM
+  sleep 1
+  _pkill_chipyard_stragglers KILL
   cleanup_tmp
   exit 130
 }
@@ -552,6 +593,16 @@ _s3_upload_build() {
   rm -f "$zip_tmp" "$zip_log"
 }
 
+# Remove local simulation logs after S3 has (or already had) the zip.
+# Honors KEEP_ARTIFACTS like maybe_cleanup.
+_cleanup_sim_out_after_s3_ok() {
+  local cls=$1 sim_out=$2
+  (( KEEP_ARTIFACTS == 1 )) && return 0
+  [[ -d $sim_out ]] || return 0
+  rm -rf -- "$sim_out"
+  echo "[cleanup-sim-out] $cls" >&2
+}
+
 # $1 cls, $2 output dir
 _s3_upload_sim() {
   local cls=$1 sim_out=$2
@@ -564,6 +615,7 @@ _s3_upload_sim() {
   if aws --profile "$AWS_PROFILE_NAME" s3api head-object \
       --bucket "$S3_BUCKET" --key "$key" >/dev/null 2>&1; then
     echo "[upload-skip] $S3_SIM_PREFIX/$cls.zip already exists" >&2
+    _cleanup_sim_out_after_s3_ok "$cls" "$sim_out"
     return 0
   fi
 
@@ -586,6 +638,7 @@ _s3_upload_sim() {
     local sz
     sz=$(stat -c %s "$zip_tmp" 2>/dev/null || echo ?)
     echo "[upload-ok] $S3_SIM_PREFIX/$cls.zip (${sz}B)" >&2
+    _cleanup_sim_out_after_s3_ok "$cls" "$sim_out"
   else
     echo "[upload-fail] $S3_SIM_PREFIX/$cls.zip: see tail" >&2
     tail -c 400 "$zip_log" >&2
@@ -602,7 +655,8 @@ maybe_cleanup() {
   echo "[cleanup]  $cls" >&2
 }
 
-export -f worker upload_artifacts _s3_upload_build _s3_upload_sim maybe_cleanup
+export -f worker upload_artifacts _s3_upload_build _s3_upload_sim \
+  maybe_cleanup _cleanup_sim_out_after_s3_ok
 
 echo "[parallel] $WORKERS workers, make -j$JOBS per build" >&2
 parallel -j "$WORKERS" --line-buffer --halt soon,fail=1 \
