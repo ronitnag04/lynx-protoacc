@@ -20,22 +20,37 @@ per-config `generated-src` tree + simulator binary between configs.
 
 ```
 Makefile                       # Bare-metal build (riscv64-unknown-elf-gcc + htif_nano.specs)
-proto_to_accel.py              # .proto + .inc → gen/bench<N>_{descriptors.h,data.c}
+proto_to_accel.py              # .proto + runtime data → gen/bench<N>_{descriptors.h,data.c}
+                               #   HPB: reads sibling benchmark.inc
+                               #   SYNTH: consumes --runtime-lengths JSON from gen_synth_proto
+gen_synth_proto.py             # Combines 5 random fleetbench Message<N>.proto files per
+                               #   synthetic bench + extracts per-field string lengths via
+                               #   lynx/fleetbench_runtime.py (output under gen/synth/). Parallel.
+gen_all_benches.py             # Batch driver: runs proto_to_accel.py over many benches in
+                               #   one process pool (`make gen_batch`). Avoids per-bench
+                               #   Python startup overhead at scale.
 gen_protoacc_sweep_configs.py  # Emits ProtoAccelSweepConfigs.scala (des/ser/joint)
-run_sweep.sh                   # Parallel sweep driver (one worker per config)
+run_sweep.sh                   # Parallel sweep driver (auto-discovers bench ids from build/)
 parse_results.py               # Aggregate bench logs → benchmark_results.json
 rocc.h                         # RoCC custom-2/custom-3 inline-asm macros
 accel_rocc.{h,c}               # AccelSetup + static serializer/deserializer regions
 bench_common.h                 # read_mcycle, print_iter/summary
-bench_hpb_{ser,des}.c          # HPB ser/des bench drivers (one ELF per bench via -D)
+bench_hpb_{ser,des}.c          # HPB/synth ser/des bench drivers (one ELF per bench via -D)
 bench_tiny_{ser,des}.c         # Minimal hand-crafted validation benches
 bench_repro.c                  # 14 minimal reproducers for state-machine bugs
 bench_isolate.c                # Per-message isolator (debug tool)
 gen/                           # Generated descriptors + data (.gitignored)
-  bench[0-5]_descriptors.h     #   emitted by `make gen`
+  bench[0-5]_descriptors.h     #   emitted by `make gen` (HPB)
   bench[0-5]_data.c            #
+  bench[6-N]_descriptors.h     #   emitted by `make gen SYNTH_COUNT=N` (synthetic)
+  bench[6-N]_data.c            #
+  synth/bench<N>/              # Source artifacts for synthetic benches:
+    benchmark.proto            #     combined fleetbench schemas
+    runtime_lengths.json       #     per-field string/bytes lengths from access_message<N>.cc
+    manifest.json              #     {seed, chosen_messages, …}
+  synth/synth_manifest.csv     #   index over all synthetic benches
 build/                         # Build artifacts (.gitignored)
-  bench[0-5]_{ser,des}.riscv   #   emitted by `make bench`
+  bench<N>_{ser,des}.riscv     #   emitted by `make bench` (HPB + synth)
 ```
 
 ## Prerequisites
@@ -79,6 +94,45 @@ Re-run only when a `.proto` schema changes, the generator changes, or you
 want a different RNG seed / cap (see
 `proto_to_accel.py --help` for `--max-nested-depth`, `--max-string-len`,
 `--seed`).
+
+#### 1b. (Optional) Add synthetic fleetbench-derived workloads
+
+HPB only ships 6 distinct schemas, which is too few for an ML model to
+generalize to out-of-distribution schemas. To expand the catalog, combine
+random subsets of the 20 fleetbench `Message<N>.proto` schemas into
+additional `bench<N>` workloads (ids 6..N, so HPB's 0..5 stay intact):
+
+```bash
+# Generate 20 synthetic benches (5 fleetbench messages each), then the
+# usual descriptor + data .c/.h pair for every id:
+make synth     SYNTH_COUNT=20 SYNTH_SEED=42   # parallel, ~0.3s at 20, ~0.9s at 4000
+make gen_batch SYNTH_COUNT=20 SYNTH_SEED=42   # parallel, ~10s at 20, ~3m at 4000
+```
+
+Use `make gen` (per-bench pattern rules with `-j$(nproc)`) instead of
+`make gen_batch` when you only want to re-emit a handful of changed benches —
+the pattern rules track per-bench dependencies but pay ~40 ms Python startup
+each, so they're only faster for small rebuilds. `gen_batch` stays in one
+Python process and farms each bench out to a worker pool (`--workers`
+defaults to `nproc/2` inside `gen_all_benches.py`); it always rebuilds
+everything in `BENCH_IDS`.
+
+`gen_synth_proto.py` writes each synthetic bench to
+`gen/synth/bench<N>/{benchmark.proto,runtime_lengths.json,manifest.json}`
+and a summary `gen/synth/synth_manifest.csv`. The runtime JSON is parsed
+from fleetbench's `access_message<N>.cc` by `lynx/fleetbench_runtime.py`
+and fed to `proto_to_accel.py` via `--runtime-lengths`. Override knobs via
+the Makefile variables: `SYNTH_N_MESSAGES` (default 5),
+`SYNTH_START` (default 6), `SYNTH_DIR` (default `gen/synth`).
+
+To wire the new benches into the analytical-features pipeline, append them
+to the verilator-bench analysis JSON and re-run the feature extractor:
+
+```bash
+cd ../lynx/analytical_model
+python3 analyze_synth.py --synth-root ../../verilator-bench/gen/synth
+python3 extract_features.py   # updates extracted_features.json in place
+```
 
 ### 2. Build the bench ELFs
 
@@ -133,9 +187,10 @@ bash run_sweep.sh --output sweep.csv
 What this does per config, in parallel:
 1. Build the Verilator simulator (`make CONFIG=<cls>`, cached between runs
    only if `--keep-artifacts`).
-2. Run every `bench[0-5]_{op}.riscv` where `op` matches the config's side
-   (des-side configs → des benches, ser-side → ser) via
-   `make run-binary-fast BREAK_SIM_PREREQ=1 LOADMEM=1`.
+2. Run every `bench<N>_{op}.riscv` (auto-discovered from `build/`: all HPB
+   ids plus any synth ids produced via `make synth SYNTH_COUNT=…`) where
+   `op` matches the config's side (des-side configs → des benches, ser-side →
+   ser) via `make run-binary-fast BREAK_SIM_PREREQ=1 LOADMEM=1`.
 3. Parse the last `ACCEL_SUMMARY:` line from
    `sims/verilator/output/chipyard.harness.TestHarness.<cls>/bench<N>_{op}.log`.
 4. Append one CSV row per bench under a file lock.
@@ -150,7 +205,7 @@ Selected useful flags (see `bash run_sweep.sh --help`):
 
 | Flag                 | Purpose                                                      |
 |----------------------|--------------------------------------------------------------|
-| `--benches b0 b1 …`  | Restrict to a subset of HPB benches (default: all six).      |
+| `--benches b0 b1 …`  | Restrict to a subset of benches (default: every `bench<N>_ser.riscv` present in `build/`, HPB + synth). |
 | `--op {ser,des,both}`| Override per-config op selection.                            |
 | `--side {des,ser,both}` | Filter which sample classes run.                          |
 | `--limit N`          | Only the first N matching configs (smoke test).              |
@@ -171,7 +226,7 @@ This lives in the Lynx repo, not here:
 ```bash
 python3 ../lynx/build_training_dataset.py \
     --sweep-csv /tmp/sweep.csv \
-    --output-base-dir /tmp/training_data
+    --output-csv /tmp/training_data.csv
 ```
 
 See [../lynx/README.md](../lynx/README.md) for the downstream training pipeline.

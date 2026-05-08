@@ -20,6 +20,14 @@
 # --skip-upload is passed (local output/ is kept when upload is skipped).
 # Upload failures are non-fatal: they log and the sweep continues.
 #
+# With --pull-s3-builds, the worker reverses the build upload before
+# building: it head-objects s3://.../verilator_build_files/<cls>.zip and,
+# if present, downloads + unzips it under $VERILATOR_DIR (restoring
+# generated-src/chipyard.harness.TestHarness.<cls> and the simulator
+# binary). Only if the pull misses or fails does it fall back to a local
+# Verilator build. Requires aws + unzip; otherwise the flag no-ops with a
+# warning.
+#
 # Side (--side) vs op (--op):
 #   --side filters which Scala config classes enter the sweep (DesSweep / SerSweep /
 #   joint ProtoAccelSweep rows in ProtoAccelSweepConfigs.scala).
@@ -33,6 +41,8 @@
 #   run_sweep.sh --output out.csv --side des --workers 8   # des configs + des ELFs (default op)
 #   run_sweep.sh --output out.csv --side both --op des     # all configs, only *_des benches
 #   run_sweep.sh --output out.csv --random-bench           # one random DEFAULT_BENCH per config
+#   run_sweep.sh --output out.csv --iter-bench             # walk synth benches 1:1 with configs,
+#                                                          # then random HPB for any remainder
 
 set -euo pipefail
 
@@ -61,7 +71,33 @@ S3_SIM_PREFIX="s3://${S3_BUCKET}/${S3_SIM_KEY_PREFIX}"
 # write these buckets (the default profile is read-only on this account).
 AWS_PROFILE_NAME="${AWS_PROFILE_NAME:-lynx}"
 
-DEFAULT_BENCHES=(bench0 bench1 bench2 bench3 bench4 bench5)
+# Default bench list: auto-discover every bench<N>_{ser,des}.riscv built
+# under $BENCH_BUILD_DIR. This keeps synthetic benches (produced by
+# `make synth SYNTH_COUNT=N` then `make bench SYNTH_COUNT=N`) in the sweep
+# by default without requiring a second source of truth. Falls back to the
+# historical bench0..bench5 list if the build dir is empty (e.g. dry-run
+# before the first `make bench`).
+_discover_default_benches() {
+  local -a benches=()
+  if [[ -d "$BENCH_BUILD_DIR" ]]; then
+    local f name id
+    # Use ser ELFs as the canonical list; des ELFs mirror the same ids.
+    while IFS= read -r -d '' f; do
+      name="$(basename "$f")"
+      name="${name%_ser.riscv}"
+      # Only accept the bench<N> shape — skip bench_tiny, bench_repro, isolate_, etc.
+      if [[ "$name" =~ ^bench[0-9]+$ ]]; then
+        benches+=("$name")
+      fi
+    done < <(find "$BENCH_BUILD_DIR" -maxdepth 1 -type f -name 'bench*_ser.riscv' -print0 2>/dev/null)
+  fi
+  if [[ ${#benches[@]} -eq 0 ]]; then
+    benches=(bench0 bench1 bench2 bench3 bench4 bench5)
+  fi
+  # Sort numerically by the <N> suffix so CSV rows come out in a stable order.
+  printf '%s\n' "${benches[@]}" | sort -V
+}
+mapfile -t DEFAULT_BENCHES < <(_discover_default_benches)
 
 # Column order and defaults — kept in sync with gen_protoacc_sweep_configs.py.
 DES_KEYS=(des_top_descriptor_reqs des_top_memloader_reqs des_cr_rocc_commands
@@ -129,8 +165,23 @@ Usage: $0 [options] --output OUT.csv
   --skip-build                don't build missing sims
   --keep-artifacts            don't delete generated-src/sim binary after use
   --skip-upload               don't zip+upload per-config artifacts to S3
+  --pull-s3-builds            before building, try to fetch prebuilt
+                              generated-src+simulator zip from S3 and unzip
+                              in place; fall back to a local build if the
+                              object is missing or the pull fails
   --random-bench              per config, run one bench chosen at random from
                               DEFAULT_BENCHES (ignores --bench / --benches)
+  --iter-bench                iterate through every synth bench (bench<N> with
+                              N >= HPB_SYNTH_START, default 6) once, pairing
+                              synth bench i with plan config i. Any remaining
+                              configs (when len(synth) < len(configs)) draw a
+                              random HPB bench (bench0..bench<HPB_SYNTH_START-1>).
+                              Ignores --bench / --benches. Useful for sweeps
+                              where synth benches are generated to roughly
+                              match the number of configs.
+  --hpb-synth-start N         bench-id boundary between HPB and synth benches
+                              (default 6, matching Makefile SYNTH_START). Only
+                              meaningful with --iter-bench.
   --dry-run                   print plan and exit
 
   --side selects hardware configs; --op selects workloads. With default --op,
@@ -150,8 +201,11 @@ BENCH_TIMEOUT=3600
 SKIP_BUILD=0
 KEEP_ARTIFACTS=0
 SKIP_UPLOAD=0
+PULL_S3_BUILDS=0
 DRY_RUN=0
 RANDOM_BENCH=0
+ITER_BENCH=0
+HPB_SYNTH_START=6
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -168,7 +222,10 @@ while [[ $# -gt 0 ]]; do
     --skip-build)     SKIP_BUILD=1; shift ;;
     --keep-artifacts) KEEP_ARTIFACTS=1; shift ;;
     --skip-upload)    SKIP_UPLOAD=1; shift ;;
+    --pull-s3-builds) PULL_S3_BUILDS=1; shift ;;
     --random-bench)   RANDOM_BENCH=1; shift ;;
+    --iter-bench)     ITER_BENCH=1; shift ;;
+    --hpb-synth-start) HPB_SYNTH_START=$2; shift 2 ;;
     --dry-run)        DRY_RUN=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)                echo "unknown arg: $1" >&2; usage; exit 2 ;;
@@ -176,8 +233,41 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$OUTPUT" ]] && { echo "--output is required" >&2; exit 2; }
-if (( RANDOM_BENCH == 0 )); then
+if (( RANDOM_BENCH == 1 && ITER_BENCH == 1 )); then
+  echo "--random-bench and --iter-bench are mutually exclusive" >&2; exit 2
+fi
+# RANDOM_BENCH samples one bench per config from DEFAULT_BENCHES. ITER_BENCH
+# pairs plan config i with synth bench i; configs past the synth pool fall
+# back to a random HPB bench. Neither mode uses --bench / --benches.
+if (( RANDOM_BENCH == 0 && ITER_BENCH == 0 )); then
   [[ ${#BENCHES[@]} -eq 0 ]] && BENCHES=("${DEFAULT_BENCHES[@]}")
+fi
+
+# Split DEFAULT_BENCHES on HPB_SYNTH_START: ids < start are HPB, >= start are
+# synth. Matches the Makefile's HPB_IDS / SYNTH_START partition so we don't
+# duplicate that knowledge here.
+SYNTH_BENCHES=()
+HPB_BENCHES_POOL=()
+for _b in "${DEFAULT_BENCHES[@]}"; do
+  _id=${_b#bench}
+  if [[ "$_id" =~ ^[0-9]+$ ]]; then
+    if (( _id >= HPB_SYNTH_START )); then
+      SYNTH_BENCHES+=("$_b")
+    else
+      HPB_BENCHES_POOL+=("$_b")
+    fi
+  fi
+done
+unset _b _id
+
+if (( ITER_BENCH == 1 )); then
+  if (( ${#SYNTH_BENCHES[@]} == 0 )); then
+    echo "[iter-bench] no synth benches found (expected bench<N>_ser.riscv with N >= $HPB_SYNTH_START under $BENCH_BUILD_DIR); run 'make synth SYNTH_COUNT=<N> && make bench SYNTH_COUNT=<N>' first." >&2
+    exit 2
+  fi
+  if (( ${#HPB_BENCHES_POOL[@]} == 0 )); then
+    echo "[iter-bench] warning: no HPB benches (bench0..bench$((HPB_SYNTH_START-1))) discovered; configs past the synth pool will be skipped." >&2
+  fi
 fi
 
 # Source the Chipyard env once — every downstream sbt/make/java call inherits.
@@ -206,6 +296,19 @@ if (( SKIP_UPLOAD == 0 )); then
   fi
 fi
 
+# S3 build pull requires aws + unzip. Disable with a warning if either is
+# missing, same pattern as --skip-upload so the sweep still makes forward
+# progress (falling back to local builds).
+if (( PULL_S3_BUILDS == 1 )); then
+  if ! command -v unzip >/dev/null; then
+    echo "[pull] 'unzip' not on PATH; disabling --pull-s3-builds." >&2
+    PULL_S3_BUILDS=0
+  elif ! command -v aws >/dev/null; then
+    echo "[pull] 'aws' CLI not on PATH; disabling --pull-s3-builds." >&2
+    PULL_S3_BUILDS=0
+  fi
+fi
+
 # Serialize the sbt assembly step. With multiple workers each discovering a
 # stale chipyard.jar, concurrent `sbt assembly` invocations overwrite the jar
 # mid-read in the downstream `java -cp ... chipyard.Generator` call, producing
@@ -215,8 +318,12 @@ echo "[prebuild] ensuring $CLASSPATH_JAR is up to date..." >&2
 make -C "$VERILATOR_DIR" CONFIG=ProtoAccelRocketConfig "$CLASSPATH_JAR" >/dev/null
 
 # Parse ProtoAccelSweepConfigs.scala: one TSV record per class, fields are
-# (cls, side, short=N short=N ...). awk collapses the /** Sweep row ... */
-# comment and the following `class` declaration into one record.
+# (cls, side, side_idx, short=N short=N ...). side_idx is a 1-based per-side
+# counter so --iter-bench can pair config i-of-side with synth bench i
+# independently for des and ser (otherwise ser rows, which follow all des
+# rows in the plan, would exhaust the synth pool and always fall back to
+# HPB). awk collapses the /** Sweep row ... */ comment and the following
+# `class` declaration into one record.
 PLAN_FILE=$(mktemp -t protoacc_sweep.XXXXXX)
 
 # On Ctrl+C / SIGTERM, tear down before exiting. Sending one wave of signals to
@@ -294,7 +401,8 @@ gawk -v side_filter="$SIDE" '
       side = (cls ~ /DesSweep/) ? "des" :
              (cls ~ /SerSweep/) ? "ser" : "joint"
       if (side_filter == "both" || side == side_filter) {
-        printf "%s\t%s\t%s\n", cls, side, params
+        side_idx[side]++
+        printf "%s\t%s\t%d\t%s\n", cls, side, side_idx[side], params
       }
       # intentionally do NOT reset params — a /** Debug printf variant of ... */
       # class immediately follows its non-debug sibling and should inherit its
@@ -313,15 +421,28 @@ TOTAL_CONFIGS=$(wc -l < "$PLAN_FILE")
 
 if (( RANDOM_BENCH == 1 )); then
   echo "Sweep plan: $TOTAL_CONFIGS configs × 1 random bench (from DEFAULT_BENCHES) × op=$OP" >&2
+elif (( ITER_BENCH == 1 )); then
+  echo "Sweep plan: $TOTAL_CONFIGS configs × 1 bench (synth pool ${#SYNTH_BENCHES[@]}, HPB pool ${#HPB_BENCHES_POOL[@]}) × op=$OP" >&2
 else
   echo "Sweep plan: $TOTAL_CONFIGS configs × ${#BENCHES[@]} bench(es) × op=$OP" >&2
 fi
 
 if (( DRY_RUN == 1 )); then
-  while IFS=$'\t' read -r cls side _; do
+  while IFS=$'\t' read -r cls side side_idx _; do
     if (( RANDOM_BENCH == 1 )); then
       rb_idx=$((RANDOM % ${#DEFAULT_BENCHES[@]}))
       echo "  would run $cls [$side] bench=${DEFAULT_BENCHES[$rb_idx]} op=$OP"
+    elif (( ITER_BENCH == 1 )); then
+      # side_idx is 1-based per-side; shift to 0-based for the synth pool.
+      dr_idx0=$((side_idx - 1))
+      if (( dr_idx0 < ${#SYNTH_BENCHES[@]} )); then
+        echo "  would run $cls [$side] bench=${SYNTH_BENCHES[$dr_idx0]} op=$OP (synth iter)"
+      elif (( ${#HPB_BENCHES_POOL[@]} > 0 )); then
+        hpb_idx=$((RANDOM % ${#HPB_BENCHES_POOL[@]}))
+        echo "  would run $cls [$side] bench=${HPB_BENCHES_POOL[$hpb_idx]} op=$OP (hpb random)"
+      else
+        echo "  would SKIP $cls [$side]: synth pool exhausted and no HPB pool"
+      fi
     else
       for bench in "${BENCHES[@]}"; do
         echo "  would run $cls [$side] bench=$bench op=$OP"
@@ -340,10 +461,12 @@ if [[ ! -f "$OUTPUT" ]]; then echo "$CSV_HEADER" > "$OUTPUT"; fi
 # Export state the worker needs (parallel spawns fresh shells per job).
 export CHIPYARD_ROOT VERILATOR_DIR VERILATOR_OUTPUT_ROOT VERILATOR_GENERATED_SRC_ROOT
 export BENCH_BUILD_DIR OUTPUT OP JOBS BENCH_TIMEOUT SKIP_BUILD KEEP_ARTIFACTS
-export SKIP_UPLOAD S3_BUCKET S3_BUILD_KEY_PREFIX S3_SIM_KEY_PREFIX S3_BUILD_PREFIX S3_SIM_PREFIX AWS_PROFILE_NAME
+export SKIP_UPLOAD PULL_S3_BUILDS S3_BUCKET S3_BUILD_KEY_PREFIX S3_SIM_KEY_PREFIX S3_BUILD_PREFIX S3_SIM_PREFIX AWS_PROFILE_NAME
 export BENCHES_STR="${BENCHES[*]}"
 export DEFAULT_BENCHES_STR="${DEFAULT_BENCHES[*]}"
-export RANDOM_BENCH
+export SYNTH_BENCHES_STR="${SYNTH_BENCHES[*]}"
+export HPB_BENCHES_POOL_STR="${HPB_BENCHES_POOL[*]}"
+export RANDOM_BENCH ITER_BENCH
 export PARAM_KEYS_STR="${PARAM_KEYS[*]}"
 export DEFAULTS_STR
 DEFAULTS_STR=""
@@ -353,9 +476,14 @@ export CSV_LOCK="${OUTPUT}.lock"
 
 worker() {
   set -u
+  # $1 is the plan line. It carries a 1-based per-side index (side_idx) that
+  # --iter-bench uses to pair config i-of-side with synth bench i, keeping
+  # des and ser runs from sharing one counter (otherwise ser configs, which
+  # follow all des configs in the plan, would always blow past the synth
+  # pool size and fall back to random HPB).
   local line=$1
-  local cls side params
-  IFS=$'\t' read -r cls side params <<< "$line"
+  local cls side side_idx params
+  IFS=$'\t' read -r cls side side_idx params <<< "$line"
 
   # Rebuild DEFAULTS / SHORT_TO_FULL assoc arrays from exported strings.
   declare -A combo short_to_full
@@ -407,6 +535,28 @@ worker() {
         pending+=("${bench}:${op}")
       fi
     done
+  elif (( ITER_BENCH == 1 )); then
+    # side_idx is 1-based per side; shift to 0-based. Config i-of-side gets
+    # synth[i] if i < len(synth); otherwise draw a random HPB bench.
+    local -a ib_synth=() ib_hpb=()
+    read -ra ib_synth <<< "$SYNTH_BENCHES_STR"
+    read -ra ib_hpb   <<< "$HPB_BENCHES_POOL_STR"
+    local idx0=$((side_idx - 1))
+    if (( idx0 < ${#ib_synth[@]} )); then
+      bench=${ib_synth[$idx0]}
+    elif (( ${#ib_hpb[@]} > 0 )); then
+      bench=${ib_hpb[$((RANDOM % ${#ib_hpb[@]}))]}
+    else
+      echo "[iter-bench-skip] $cls: synth pool exhausted at idx=$idx0, no HPB pool" >&2
+      upload_artifacts "$cls"
+      maybe_cleanup "$cls"
+      return 0
+    fi
+    for op in "${ops[@]}"; do
+      if ! grep -q "^${cls},${side},${bench},${op}," "$OUTPUT" 2>/dev/null; then
+        pending+=("${bench}:${op}")
+      fi
+    done
   else
     for op in "${ops[@]}"; do
       for bench in $BENCHES_STR; do
@@ -429,6 +579,10 @@ worker() {
   local sim_bin="$VERILATOR_DIR/simulator-chipyard.harness-$cls"
   local build_wall_s=0 was_cached=0
   if [[ -x "$sim_bin" ]]; then
+    was_cached=1
+  elif (( PULL_S3_BUILDS == 1 )) && _s3_pull_build "$cls"; then
+    # Treat S3-pulled builds as cached: build_wall_s stays 0 and
+    # build_was_cached=1 in the CSV, matching how on-disk reuse is reported.
     was_cached=1
   elif (( SKIP_BUILD == 1 )); then
     echo "[skip-build] $cls" >&2
@@ -593,6 +747,67 @@ _s3_upload_build() {
   rm -f "$zip_tmp" "$zip_log"
 }
 
+# Reverse of _s3_upload_build: try to fetch s3://.../<S3_BUILD_KEY_PREFIX>/<cls>.zip
+# and unzip it under $VERILATOR_DIR so that generated-src/chipyard.harness.TestHarness.<cls>
+# and simulator-chipyard.harness-<cls>[.debug] reappear in the exact layout a
+# local `make` would produce. Returns 0 on a usable restore (simulator binary
+# present and executable), nonzero otherwise — caller falls back to a local
+# build on failure.
+#
+# Idempotent with the on-disk check in the caller: if a fresh sim_bin already
+# exists the caller short-circuits before ever calling us.
+_s3_pull_build() {
+  local cls=$1
+  local key="$S3_BUILD_KEY_PREFIX/$cls.zip"
+  local sim_bin="$VERILATOR_DIR/simulator-chipyard.harness-$cls"
+
+  # Cheap existence probe first — avoids spawning a download on misses.
+  if ! aws --profile "$AWS_PROFILE_NAME" s3api head-object \
+      --bucket "$S3_BUCKET" --key "$key" >/dev/null 2>&1; then
+    echo "[pull-miss] $S3_BUILD_PREFIX/$cls.zip" >&2
+    return 1
+  fi
+
+  local zip_tmp pull_log
+  zip_tmp=$(mktemp -t "pull_${cls}.XXXXXX.zip")
+  pull_log=$(mktemp -t "pull_${cls}.XXXXXX.log")
+
+  if ! aws --profile "$AWS_PROFILE_NAME" s3 cp --only-show-errors \
+      "$S3_BUILD_PREFIX/$cls.zip" "$zip_tmp" >"$pull_log" 2>&1; then
+    echo "[pull-fail] $S3_BUILD_PREFIX/$cls.zip download: see tail" >&2
+    tail -c 400 "$pull_log" >&2
+    rm -f "$zip_tmp" "$pull_log"
+    return 1
+  fi
+
+  # Matching _s3_upload_build: archive paths are relative to $VERILATOR_DIR,
+  # so unzip from that cwd restores them to the expected locations. -o
+  # overwrites any stale partial artifacts rather than prompting.
+  if ! (cd "$VERILATOR_DIR" && unzip -o -q "$zip_tmp") >"$pull_log" 2>&1; then
+    echo "[pull-fail] $cls unzip: see tail" >&2
+    tail -c 400 "$pull_log" >&2
+    rm -f "$zip_tmp" "$pull_log"
+    return 1
+  fi
+
+  rm -f "$zip_tmp" "$pull_log"
+
+  # zip archives don't preserve +x on all filesystems; re-mark the simulator
+  # executable so the subsequent run-binary-fast target accepts it.
+  [[ -f $sim_bin ]] && chmod +x "$sim_bin" 2>/dev/null || true
+  [[ -f "${sim_bin}.debug" ]] && chmod +x "${sim_bin}.debug" 2>/dev/null || true
+
+  if [[ ! -x $sim_bin ]]; then
+    echo "[pull-fail] $cls: simulator binary missing after unzip" >&2
+    return 1
+  fi
+
+  local sz
+  sz=$(stat -c %s "$sim_bin" 2>/dev/null || echo ?)
+  echo "[pull-ok]  $S3_BUILD_PREFIX/$cls.zip → sim=${sz}B" >&2
+  return 0
+}
+
 # Remove local simulation logs after S3 has (or already had) the zip.
 # Honors KEEP_ARTIFACTS like maybe_cleanup.
 _cleanup_sim_out_after_s3_ok() {
@@ -656,11 +871,11 @@ maybe_cleanup() {
 }
 
 export -f worker upload_artifacts _s3_upload_build _s3_upload_sim \
-  maybe_cleanup _cleanup_sim_out_after_s3_ok
+  _s3_pull_build maybe_cleanup _cleanup_sim_out_after_s3_ok
 
 echo "[parallel] $WORKERS workers, make -j$JOBS per build" >&2
 parallel -j "$WORKERS" --line-buffer --halt soon,fail=1 \
   --termseq INT,1000,TERM,2000,KILL,25 \
-  worker :::: "$PLAN_FILE"
+  worker '{}' :::: "$PLAN_FILE"
 
 echo "Wrote $OUTPUT" >&2

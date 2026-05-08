@@ -1,12 +1,10 @@
 # Build artifacts
 build/
+gen/
 *.o
 *.riscv
 *.dump
 
-# Generator output (regenerate with `make gen`)
-gen/bench*_data.c
-gen/bench*_descriptors.h
 
 # Benchmark results (regenerate with `parse_results.py`)
 benchmark_results.json

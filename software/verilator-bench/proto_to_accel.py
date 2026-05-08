@@ -402,7 +402,35 @@ def descriptor_for(rm: ResolvedMessage, resolved: Dict[str, ResolvedMessage]) ->
                 f"  /* f{actual_fn} {rf.name} ({tname} @ {rf.offset}) */ "
                 f"0x{word_a:016x}ULL, 0ULL,"
             )
-    lines.append(f"  /* is_submessage_bitfield */ {hex(is_submessage_mask)}ULL,")
+    # is_submessage bitfield: HW reads 32-bit chunks at
+    # (rel_fn >> 5) << 2 from this region's base
+    # (descriptortablehandler_ser.scala:156). One 32-bit word spans 32
+    # relative-field-numbers. Schemas with large field-number spans (common
+    # in fleetbench's synthetic benches, where rel_fn can reach ~130) need
+    # multiple chunks; packing the mask into a single uint64 both warns the
+    # compiler ("integer constant too large") and reads garbage from HW's
+    # array-indexed loads past the first word.
+    #
+    # Match the hasbits chunking formula (resolve_all ln ~274-275):
+    #   span_plus_sentinel = n_fields + 1   (+1 for the rel_fn=0 sentinel)
+    #   n_submsg_chunks    = ceil(span_plus_sentinel / 32)
+    # Pack the chunks 2-per-uint64 (little-endian) so the surrounding
+    # uint64_t[] descriptor array alignment is preserved.
+    n_submsg_chunks = (n_fields + 1 + 31) // 32
+    # Emit each pair of 32-bit chunks as one uint64_t line. Odd-count tail
+    # chunk lives in the low 32 bits of a final uint64_t.
+    mask_full = is_submessage_mask & ((1 << (32 * n_submsg_chunks)) - 1)
+    bitfield_lines = []
+    for chunk_pair_i in range(0, n_submsg_chunks, 2):
+        lo = (mask_full >> (32 * chunk_pair_i)) & 0xFFFFFFFF
+        hi = (mask_full >> (32 * (chunk_pair_i + 1))) & 0xFFFFFFFF \
+            if chunk_pair_i + 1 < n_submsg_chunks else 0
+        packed = (hi << 32) | lo
+        bitfield_lines.append(
+            f"  /* is_submessage_bitfield chunks {chunk_pair_i},"
+            f"{chunk_pair_i+1} */ 0x{packed:016x}ULL,"
+        )
+    lines.extend(bitfield_lines)
     return lines
 
 
@@ -1002,6 +1030,12 @@ def main():
                     help=f"Cap on individual string/bytes payload length (default: "
                          f"{DEFAULT_MAX_STRING_LEN}). Real HPB strings reach MBs which "
                          f"bloat Verilator binaries.")
+    ap.add_argument("--runtime-lengths", type=Path,
+                    help="Optional JSON file with per-message field length "
+                         "observations ({msg_simple_name: {field_name: [lengths...]}}). "
+                         "Used when the proto has no sibling HPB .inc (e.g. synthetic "
+                         "benches built from fleetbench via gen_synth_proto.py). "
+                         "Merged on top of any .inc-derived data.")
     args = ap.parse_args()
 
     analyzer = ProtobufAnalyzer(args.proto)
@@ -1035,6 +1069,20 @@ def main():
         if per_field:
             runtime_lengths[msg_name] = per_field
 
+    # Synthetic benches (no HPB .inc) pass a precomputed JSON built from
+    # fleetbench's access_message<N>.cc files. Merge rather than replace so a
+    # proto with both sources (unlikely today, but free to support) still
+    # picks up everything.
+    if args.runtime_lengths:
+        import json
+        if not args.runtime_lengths.is_file():
+            sys.exit(f"--runtime-lengths file not found: {args.runtime_lengths}")
+        extra = json.loads(args.runtime_lengths.read_text())
+        for msg_name, per_field in extra.items():
+            dst = runtime_lengths.setdefault(msg_name, {})
+            for fname, lengths in per_field.items():
+                dst.setdefault(fname, []).extend(lengths)
+
     emit_header(resolved, out_h, args.proto, top)
     emit_source(resolved, out_c, out_h, top, args.seed, args.max_nested_depth,
                 runtime_lengths=runtime_lengths,
@@ -1042,7 +1090,7 @@ def main():
 
     n_fields_with_rt = sum(len(v) for v in runtime_lengths.values())
     print(f"Wrote {out_h} ({len(resolved)} descriptors).", file=sys.stderr)
-    print(f"Wrote {out_c} (top-level: {top}, .inc runtime fields: {n_fields_with_rt}).",
+    print(f"Wrote {out_c} (top-level: {top}, runtime fields: {n_fields_with_rt}).",
           file=sys.stderr)
 
 
