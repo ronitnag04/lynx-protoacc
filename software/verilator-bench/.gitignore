@@ -6,8 +6,8 @@ gen/
 *.dump
 
 
-# Benchmark results (regenerate with `parse_results.py`)
-benchmark_results.json
+# Results
+*.json
 *.csv
 
 # Runtime / debug

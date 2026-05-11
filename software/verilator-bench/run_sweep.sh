@@ -48,8 +48,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Chipyard repo root: .../generators/protoacc/software/verilator-bench → ../../../../
+CONFIGS="${CONFIGS=-ProtoAccelSweepConfigs.scala}"
 CHIPYARD_ROOT="${CHIPYARD_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
-SWEEP_SCALA="$CHIPYARD_ROOT/generators/chipyard/src/main/scala/config/ProtoAccelSweepConfigs.scala"
+SWEEP_SCALA="$CHIPYARD_ROOT/generators/chipyard/src/main/scala/config/$CONFIGS"
 VERILATOR_DIR="$CHIPYARD_ROOT/sims/verilator"
 VERILATOR_OUTPUT_ROOT="$VERILATOR_DIR/output"
 VERILATOR_GENERATED_SRC_ROOT="$VERILATOR_DIR/generated-src"
@@ -162,6 +163,20 @@ Usage: $0 [options] --output OUT.csv
   --jobs N                    make -j for each Verilator build (default: 1)
   --workers N                 parallel configs (default: nproc)
   --bench-timeout SEC         per-bench wall cap (default: 3600)
+  --bench-parallel N          within a single config, run up to N (bench, op)
+                              simulations in parallel AFTER the build has
+                              finished (default: 1 = serial). Each bench still
+                              invokes 'make run-binary-fast' with BREAK_SIM_PREREQ=1,
+                              so no sim rebuild happens under the fan-out; the
+                              only shared side effect is the idempotent output-dir
+                              mkdir and each bench writes to its own
+                              <bench>_<op>.log. Recommended for pareto-validation
+                              sweeps and the default-config sweep (few configs,
+                              many benches per config); not useful when the
+                              sweep already has many configs saturating
+                              --workers. Memory: each sim can take multiple GB —
+                              the effective peak is up to WORKERS*BENCH_PARALLEL
+                              concurrent sims, so budget accordingly.
   --skip-build                don't build missing sims
   --keep-artifacts            don't delete generated-src/sim binary after use
   --skip-upload               don't zip+upload per-config artifacts to S3
@@ -198,6 +213,7 @@ LIMIT=0
 JOBS=1
 WORKERS=$(nproc)
 BENCH_TIMEOUT=3600
+BENCH_PARALLEL=1
 SKIP_BUILD=0
 KEEP_ARTIFACTS=0
 SKIP_UPLOAD=0
@@ -219,6 +235,7 @@ while [[ $# -gt 0 ]]; do
     --jobs)           JOBS=$2; shift 2 ;;
     --workers)        WORKERS=$2; shift 2 ;;
     --bench-timeout)  BENCH_TIMEOUT=$2; shift 2 ;;
+    --bench-parallel) BENCH_PARALLEL=$2; shift 2 ;;
     --skip-build)     SKIP_BUILD=1; shift ;;
     --keep-artifacts) KEEP_ARTIFACTS=1; shift ;;
     --skip-upload)    SKIP_UPLOAD=1; shift ;;
@@ -233,6 +250,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$OUTPUT" ]] && { echo "--output is required" >&2; exit 2; }
+if ! [[ "$BENCH_PARALLEL" =~ ^[0-9]+$ ]] || (( BENCH_PARALLEL < 1 )); then
+  echo "--bench-parallel must be a positive integer (got '$BENCH_PARALLEL')" >&2; exit 2
+fi
 if (( RANDOM_BENCH == 1 && ITER_BENCH == 1 )); then
   echo "--random-bench and --iter-bench are mutually exclusive" >&2; exit 2
 fi
@@ -460,7 +480,7 @@ if [[ ! -f "$OUTPUT" ]]; then echo "$CSV_HEADER" > "$OUTPUT"; fi
 
 # Export state the worker needs (parallel spawns fresh shells per job).
 export CHIPYARD_ROOT VERILATOR_DIR VERILATOR_OUTPUT_ROOT VERILATOR_GENERATED_SRC_ROOT
-export BENCH_BUILD_DIR OUTPUT OP JOBS BENCH_TIMEOUT SKIP_BUILD KEEP_ARTIFACTS
+export BENCH_BUILD_DIR OUTPUT OP JOBS BENCH_TIMEOUT BENCH_PARALLEL SKIP_BUILD KEEP_ARTIFACTS
 export SKIP_UPLOAD PULL_S3_BUILDS S3_BUCKET S3_BUILD_KEY_PREFIX S3_SIM_KEY_PREFIX S3_BUILD_PREFIX S3_SIM_PREFIX AWS_PROFILE_NAME
 export BENCHES_STR="${BENCHES[*]}"
 export DEFAULT_BENCHES_STR="${DEFAULT_BENCHES[*]}"
@@ -604,73 +624,124 @@ worker() {
     echo "[build-ok] $cls wall=${build_wall_s}s" >&2
   fi
 
-  # Run each pending bench and append a row per success.
-  local build_attributed=0
+  # Param-value CSV suffix is identical for every (bench, op) of this config;
+  # precompute it once so _run_bench_pair stays a pure per-bench function.
+  local csv_suffix="" pk
+  for pk in $PARAM_KEYS_STR; do csv_suffix+=",${combo[$pk]}"; done
+
+  # Attribute the build cost to exactly one CSV row (first bench in the
+  # pending list). Every other row records this_build_wall=0,
+  # build_was_cached=1 so downstream readers see a single non-zero
+  # build_wall_s per config and don't double-count. This is the same
+  # bookkeeping the old serial loop used via build_attributed; doing it
+  # up front lets us fan the loop out in parallel without coordinating
+  # which child "won" the attribution.
+  local -a bench_list=() op_list=() bw_list=() cached_list=()
+  local i=0
   for p in "${pending[@]}"; do
-    bench=${p%%:*}
-    op=${p##*:}
-    local elf="$BENCH_BUILD_DIR/${bench}_${op}.riscv"
-    if [[ ! -f $elf ]]; then
-      echo "[elf-missing] $elf" >&2
-      continue
-    fi
-
-    echo "[run]      $cls × ${bench}_${op}" >&2
-    local rt0=$SECONDS
-    timeout "$BENCH_TIMEOUT" \
-      make -C "$VERILATOR_DIR" \
-        CONFIG="$cls" BREAK_SIM_PREREQ=1 LOADMEM=1 \
-        run-binary-fast BINARY="$elf" >/dev/null 2>&1 || true
-    local wall=$((SECONDS - rt0))
-
-    local log="$VERILATOR_OUTPUT_ROOT/chipyard.harness.TestHarness.$cls/${bench}_${op}.log"
-    if [[ ! -f $log ]]; then
-      echo "[no-log]   $log" >&2
-      continue
-    fi
-    # Match Python: take the LAST ACCEL_SUMMARY line in the log.
-    local summary
-    summary=$(grep 'ACCEL_SUMMARY:' "$log" | tail -1 || true)
-    if [[ -z $summary ]]; then
-      echo "[no-summary] $log (wall=${wall}s)" >&2
-      continue
-    fi
-
-    local iters cycles bytes
-    iters=$(grep -oP 'iters=\K[0-9]+' <<<"$summary" || echo 0)
-    cycles=$(grep -oP 'total_cycles=\K[0-9]+' <<<"$summary" || echo 0)
-    bytes=$(grep -oP 'total_bytes=\K[0-9]+' <<<"$summary" || echo 0)
-
-    local tput=0
-    if (( cycles > 0 )); then
-      tput=$(awk -v b="$bytes" -v c="$cycles" 'BEGIN{printf "%.6f", b*1e9/c}')
-    fi
-
-    local this_build_wall=0
-    local cached_col=$was_cached
-    if (( build_attributed == 0 )); then
-      this_build_wall=$build_wall_s
-      build_attributed=1
+    bench_list+=("${p%%:*}")
+    op_list+=("${p##*:}")
+    if (( i == 0 )); then
+      bw_list+=("$build_wall_s")
+      cached_list+=("$was_cached")
     else
-      cached_col=1
+      bw_list+=(0)
+      cached_list+=(1)
     fi
-
-    # Assemble the CSV row in the declared column order.
-    local row="$cls,$side,$bench,$op,$iters,$cycles,$bytes,$tput,$wall,$this_build_wall,$cached_col"
-    local pk
-    for pk in $PARAM_KEYS_STR; do row+=",${combo[$pk]}"; done
-
-    # Lock-serialized append so concurrent workers don't interleave lines.
-    (
-      flock -w 60 9
-      echo "$row" >> "$OUTPUT"
-    ) 9>"$CSV_LOCK"
-
-    echo "[done]     $cls × ${bench}_${op}: ${wall}s, ${bytes}B / ${cycles}cyc" >&2
+    i=$((i+1))
   done
+
+  if (( BENCH_PARALLEL > 1 )) && (( ${#pending[@]} > 1 )); then
+    # Parallel path: fan out each bench into a background subshell, capped
+    # at BENCH_PARALLEL concurrent. Needs bash 4.3+ for `wait -n`. Each
+    # subshell uses its own rt0, its own log, and CSV appends are already
+    # flock-serialized inside _run_bench_pair.
+    echo "[run-p]    $cls × ${#pending[@]} benches (parallel=$BENCH_PARALLEL)" >&2
+    local running=0 idx
+    for (( idx=0; idx<${#bench_list[@]}; idx++ )); do
+      while (( running >= BENCH_PARALLEL )); do
+        wait -n 2>/dev/null || true
+        running=$((running - 1))
+      done
+      _run_bench_pair "$cls" "$side" \
+        "${bench_list[$idx]}" "${op_list[$idx]}" \
+        "${bw_list[$idx]}" "${cached_list[$idx]}" \
+        "$csv_suffix" &
+      running=$((running + 1))
+    done
+    wait
+  else
+    local idx
+    for (( idx=0; idx<${#bench_list[@]}; idx++ )); do
+      _run_bench_pair "$cls" "$side" \
+        "${bench_list[$idx]}" "${op_list[$idx]}" \
+        "${bw_list[$idx]}" "${cached_list[$idx]}" \
+        "$csv_suffix"
+    done
+  fi
 
   upload_artifacts "$cls"
   maybe_cleanup "$cls"
+}
+
+# Run one (bench, op) against an already-built simulator and append its CSV
+# row. Safe to call concurrently for distinct BINARYs under the same CONFIG:
+# %.run.fast in common.mk only writes to $output_dir/<BINARY>.log (unique per
+# bench) and its one shared prereq — mkdir -p of the output dir — is
+# idempotent. SIM_PREREQ is suppressed via BREAK_SIM_PREREQ=1 so make won't
+# try to rebuild the sim.
+#
+# Args: cls side bench op build_wall_s cached_col csv_suffix
+# csv_suffix is the leading "," + comma-joined param values for this config.
+_run_bench_pair() {
+  set -u
+  local cls=$1 side=$2 bench=$3 op=$4
+  local this_build_wall=$5 cached_col=$6 csv_suffix=$7
+
+  local elf="$BENCH_BUILD_DIR/${bench}_${op}.riscv"
+  if [[ ! -f $elf ]]; then
+    echo "[elf-missing] $elf" >&2
+    return 0
+  fi
+
+  echo "[run]      $cls × ${bench}_${op}" >&2
+  local rt0=$SECONDS
+  timeout "$BENCH_TIMEOUT" \
+    make -C "$VERILATOR_DIR" \
+      CONFIG="$cls" BREAK_SIM_PREREQ=1 LOADMEM=1 \
+      run-binary-fast BINARY="$elf" >/dev/null 2>&1 || true
+  local wall=$((SECONDS - rt0))
+
+  local log="$VERILATOR_OUTPUT_ROOT/chipyard.harness.TestHarness.$cls/${bench}_${op}.log"
+  if [[ ! -f $log ]]; then
+    echo "[no-log]   $log" >&2
+    return 0
+  fi
+  local summary
+  summary=$(grep 'ACCEL_SUMMARY:' "$log" | tail -1 || true)
+  if [[ -z $summary ]]; then
+    echo "[no-summary] $log (wall=${wall}s)" >&2
+    return 0
+  fi
+
+  local iters cycles bytes
+  iters=$(grep -oP 'iters=\K[0-9]+'        <<<"$summary" || echo 0)
+  cycles=$(grep -oP 'total_cycles=\K[0-9]+' <<<"$summary" || echo 0)
+  bytes=$(grep -oP 'total_bytes=\K[0-9]+'   <<<"$summary" || echo 0)
+
+  local tput=0
+  if (( cycles > 0 )); then
+    tput=$(awk -v b="$bytes" -v c="$cycles" 'BEGIN{printf "%.6f", b*1e9/c}')
+  fi
+
+  local row="$cls,$side,$bench,$op,$iters,$cycles,$bytes,$tput,$wall,$this_build_wall,$cached_col$csv_suffix"
+
+  (
+    flock -w 60 9
+    echo "$row" >> "$OUTPUT"
+  ) 9>"$CSV_LOCK"
+
+  echo "[done]     $cls × ${bench}_${op}: ${wall}s, ${bytes}B / ${cycles}cyc" >&2
 }
 
 # Zip build artifacts (generated-src + simulator binary) and simulation
@@ -870,10 +941,10 @@ maybe_cleanup() {
   echo "[cleanup]  $cls" >&2
 }
 
-export -f worker upload_artifacts _s3_upload_build _s3_upload_sim \
+export -f worker _run_bench_pair upload_artifacts _s3_upload_build _s3_upload_sim \
   _s3_pull_build maybe_cleanup _cleanup_sim_out_after_s3_ok
 
-echo "[parallel] $WORKERS workers, make -j$JOBS per build" >&2
+echo "[parallel] $WORKERS workers, make -j$JOBS per build, bench-parallel=$BENCH_PARALLEL" >&2
 parallel -j "$WORKERS" --line-buffer --halt soon,fail=1 \
   --termseq INT,1000,TERM,2000,KILL,25 \
   worker '{}' :::: "$PLAN_FILE"

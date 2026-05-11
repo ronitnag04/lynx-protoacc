@@ -35,16 +35,24 @@ Debug (``--debug``) variants get a ``Debug`` infix after the side tag, e.g.
 Mixed-radix axis order within a side is sorted keys for that side
 (``des_*`` then ``ser_*`` when combined for fragment emission order).
 
+A separate mode ``--write-default`` bypasses sweep generation entirely and
+emits ``ProtoAccelDefaultConfigs.scala`` with a single ``ProtoAccelDefaultConfig``
+class holding every ``des_*`` and ``ser_*`` parameter at its merged default
+(plus ``ProtoAccelDefaultDebugConfig`` under ``--debug``). No acronym suffix
+is appended to the class name, so this config serves as a stable baseline.
+
 Examples:
   python3 gen_protoacc_sweep_configs.py -t random -n 32 -s 42
   python3 gen_protoacc_sweep_configs.py --emit des -t ofat -o /tmp/out.scala
   python3 gen_protoacc_sweep_configs.py --emit joint -t random -n 16 -s 0
+  python3 gen_protoacc_sweep_configs.py --write-default
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence, Tuple
@@ -61,6 +69,7 @@ DEFAULT_OUT = (
     / "ProtoAccelSweepConfigs.scala"
 )
 DEFAULT_CSV_OUT = SCRIPT_DIR / "sweep_configs.csv"
+DEFAULT_SCALA_CONFIG_DIR = DEFAULT_OUT.parent
 
 # --- Deserializer queue / depth parameters (``des_*`` keys) -----------------
 
@@ -622,6 +631,204 @@ def write_configs_csv(
             writer.writerow(row)
 
 
+def _validation_artifacts_from_pareto_json(
+    pareto_json_path: Path,
+) -> Tuple[
+    str,
+    Tuple[str, ...],
+    str,
+    str,
+    str,
+    List[Dict[str, int]],
+    Path,
+]:
+    """Return side metadata + deduped validation combos + output CSV path."""
+    try:
+        payload = json.loads(pareto_json_path.read_text(encoding="utf-8"))
+    except OSError as e:
+        raise SystemExit(f"Failed to read pareto JSON {pareto_json_path}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Invalid JSON in {pareto_json_path}: {e}") from e
+
+    side = payload.get("side")
+    if side == "des":
+        name_keys = DES_KEYS
+        class_prefix = "ProtoAccelDesSweep"
+        class_debug_prefix = "ProtoAccelDesSweepDebug"
+    elif side == "ser":
+        name_keys = SER_KEYS
+        class_prefix = "ProtoAccelSerSweep"
+        class_debug_prefix = "ProtoAccelSerSweepDebug"
+    else:
+        raise SystemExit(
+            f"{pareto_json_path}: expected top-level 'side' to be 'des' or 'ser', got {side!r}"
+        )
+
+    pareto_front = payload.get("pareto_front")
+    if not isinstance(pareto_front, list):
+        raise SystemExit(f"{pareto_json_path}: missing or invalid 'pareto_front' list")
+
+    combos: List[Dict[str, int]] = []
+    for i, point in enumerate(pareto_front):
+        if not isinstance(point, Mapping):
+            raise SystemExit(f"{pareto_json_path}: pareto_front[{i}] must be an object")
+        if not bool(point.get("validation_candidate", False)):
+            continue
+        cfg = point.get("config")
+        if not isinstance(cfg, Mapping):
+            raise SystemExit(f"{pareto_json_path}: pareto_front[{i}].config must be an object")
+
+        combo = dict(DEFAULT_PARAM_VALUES)
+        for k in name_keys:
+            if k not in cfg:
+                raise SystemExit(
+                    f"{pareto_json_path}: pareto_front[{i}].config missing key {k!r}"
+                )
+            combo[k] = int(cfg[k])
+        combos.append(combo)
+
+    out_path = pareto_json_path.parent / f"{side}_pareto_validation_sweep_configs.csv"
+    deduped = _dedupe_by_name(combos, name_keys)
+    return (
+        side,
+        name_keys,
+        class_prefix,
+        class_debug_prefix,
+        _csv_side_tag(name_keys),
+        deduped,
+        out_path,
+    )
+
+
+def write_validation_csv_from_pareto_json(pareto_json_path: Path) -> Path:
+    """Extract validation candidates from a pareto-front JSON and emit sweep CSV."""
+    (
+        _side,
+        name_keys,
+        class_prefix,
+        class_debug_prefix,
+        side_tag,
+        deduped,
+        out_path,
+    ) = _validation_artifacts_from_pareto_json(pareto_json_path)
+    rows = [
+        _combo_csv_row(
+            class_prefix=class_prefix,
+            class_debug_prefix=class_debug_prefix,
+            name_keys=name_keys,
+            combo=c,
+            side_tag=side_tag,
+        )
+        for c in deduped
+    ]
+    write_configs_csv(out_path, rows)
+    return out_path
+
+
+def write_validation_scala_from_pareto_json(
+    pareto_json_path: Path, *, generate_debug: bool
+) -> Tuple[Path, int, int]:
+    """Emit side-specific Scala configs for validation candidates."""
+    (
+        side,
+        name_keys,
+        _class_prefix,
+        _class_debug_prefix,
+        _side_tag,
+        deduped,
+        _csv_out_path,
+    ) = _validation_artifacts_from_pareto_json(pareto_json_path)
+
+    if side == "des":
+        object_name = "ProtoAccelDeserializerValidationConfigs"
+        class_prefix = "ProtoAccelDesSweep"
+        class_debug_prefix = "ProtoAccelDesSweepDebug"
+        scala_name = "ProtoAccelDeserializerValidationConfigs.scala"
+    else:
+        object_name = "ProtoAccelSerializerValidationConfigs"
+        class_prefix = "ProtoAccelSerSweep"
+        class_debug_prefix = "ProtoAccelSerSweepDebug"
+        scala_name = "ProtoAccelSerializerValidationConfigs.scala"
+
+    lines: List[str] = [
+        "// GENERATED FILE — do not edit by hand.",
+        "// Regenerate:",
+        "//   python3 generators/protoacc/software/verilator-bench/gen_protoacc_sweep_configs.py \\",
+        "//       --pareto-front-json <path/to/*_pareto_front.json> [--debug]",
+        "//",
+        f"// source={pareto_json_path}",
+        "// Composes on `ProtoAccelRocketBaseConfig` (HyperscaleConfigs.scala).",
+        "",
+        "package chipyard",
+        "",
+        "import org.chipsalliance.cde.config.Config",
+        "",
+    ]
+
+    emitted = _emit_side_block(
+        lines=lines,
+        object_name=object_name,
+        class_prefix=class_prefix,
+        class_debug_prefix=class_debug_prefix,
+        name_keys=name_keys,
+        combinations=deduped,
+        sweep_type="pareto_validation",
+        seed=0,
+        num_configs_requested=len(deduped),
+        generate_debug=generate_debug,
+    )
+
+    out_path = DEFAULT_SCALA_CONFIG_DIR / scala_name
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    total_classes = emitted * (2 if generate_debug else 1)
+    return out_path, emitted, total_classes
+
+
+def write_default_scala(
+    out_path: Path, *, generate_debug: bool
+) -> Tuple[Path, int]:
+    """Emit ``ProtoAccelDefaultConfigs.scala`` with one default baseline class.
+
+    The class name is ``ProtoAccelDefaultConfig`` (no acronym suffix), since
+    every parameter sits at its merged default value. Returns (path, total
+    Scala class count emitted).
+    """
+    combo = dict(DEFAULT_PARAM_VALUES)
+    lines: List[str] = [
+        "// GENERATED FILE — do not edit by hand.",
+        "// Regenerate:",
+        "//   python3 generators/protoacc/software/verilator-bench/gen_protoacc_sweep_configs.py \\",
+        "//       --write-default [--debug]",
+        "//",
+        "// Single baseline with every des_* and ser_* parameter at its default.",
+        "// Composes on `ProtoAccelRocketBaseConfig` (HyperscaleConfigs.scala).",
+        "",
+        "package chipyard",
+        "",
+        "import org.chipsalliance.cde.config.Config",
+        "",
+    ]
+
+    emitted = _emit_side_block(
+        lines=lines,
+        object_name="ProtoAccelDefaultConfigs",
+        class_prefix="ProtoAccelSweepDefault",
+        class_debug_prefix="ProtoAccelSweepDefaultDebug",
+        name_keys=(),
+        combinations=[combo],
+        sweep_type="default",
+        seed=0,
+        num_configs_requested=1,
+        generate_debug=generate_debug,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    total_classes = emitted * (2 if generate_debug else 1)
+    return out_path, total_classes
+
+
 def render_file_joint(
     *,
     out_path: Path,
@@ -805,9 +1012,46 @@ def main() -> None:
             f"Default: {DEFAULT_CSV_OUT}"
         ),
     )
+    parser.add_argument(
+        "--write-default",
+        action="store_true",
+        help=(
+            "Emit ProtoAccelDefaultConfigs.scala with a single "
+            "ProtoAccelDefaultConfig class holding every des_*/ser_* parameter "
+            "at its merged default value. Skips sweep generation; other sweep "
+            "flags are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--pareto-front-json",
+        type=Path,
+        default=None,
+        help=(
+            "If set, read pareto_front JSON, select points with "
+            "validation_candidate=true, and emit <side>_pareto_validation_sweep_configs.csv "
+            "next to the JSON. Skips Scala/random sweep generation."
+        ),
+    )
     args = parser.parse_args()
 
     _validate_tables()
+
+    if args.write_default:
+        out_scala = DEFAULT_SCALA_CONFIG_DIR / "ProtoAccelDefaultConfigs.scala"
+        out_path, total = write_default_scala(out_scala, generate_debug=args.debug)
+        print(f"Wrote {out_path} (1 default config, {total} Scala class(es))")
+        return
+
+    if args.pareto_front_json is not None:
+        out_csv = write_validation_csv_from_pareto_json(args.pareto_front_json)
+        out_scala, emitted, total = write_validation_scala_from_pareto_json(
+            args.pareto_front_json, generate_debug=args.debug
+        )
+        print(f"Wrote {out_csv} (validation candidates from {args.pareto_front_json})")
+        print(
+            f"Wrote {out_scala} ({emitted} validation configs, {total} Scala classes)"
+        )
+        return
 
     emit = args.emit
     sweep_type = args.sweep_type
